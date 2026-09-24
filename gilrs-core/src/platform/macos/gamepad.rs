@@ -217,7 +217,11 @@ impl Gamepad {
                 if page == kHIDPage_GenericDesktop {
                     page
                 } else {
-                    error!("Failed to get valid device. Expecting kHIDPage_GenericDesktop. Got 0x{:X?}", page);
+                    error!(
+                        "Failed to get valid device. Expecting kHIDPage_GenericDesktop. Got \
+                         0x{:X?}",
+                        page
+                    );
                     return None;
                 }
             }

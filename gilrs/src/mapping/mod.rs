@@ -9,7 +9,6 @@
 mod parser;
 
 use crate::ev::{self, Axis, AxisOrBtn, Button};
-use crate::utils::PATH_SEPARATOR;
 use gilrs_core::native_ev_codes as nec;
 use gilrs_core::EvCode;
 
@@ -346,14 +345,10 @@ impl Mapping {
                         if to.is_button() {
                             match to {
                                 AxisOrBtn::Btn(Button::DPadLeft | Button::DPadRight) => {
-                                    mapping
-                                        .mappings
-                                        .insert(from_axis, AxisOrBtn::Axis(Axis::DPadX));
+                                    mapping.mappings.insert(from_axis, Axis::DPadX.into());
                                 }
                                 AxisOrBtn::Btn(Button::DPadUp | Button::DPadDown) => {
-                                    mapping
-                                        .mappings
-                                        .insert(from_axis, AxisOrBtn::Axis(Axis::DPadY));
+                                    mapping.mappings.insert(from_axis, Axis::DPadY.into());
                                 }
                                 _ => (),
                             }
@@ -384,7 +379,7 @@ impl Mapping {
             .position(|&x| x == ev_code)
             .ok_or(MappingError::InvalidCode(ev::Code(ev_code)))?;
         let _ = write!(sdl_mappings, "{}:b{},", ident, n_btn);
-        mappings.insert(ev_code, AxisOrBtn::Btn(mapped_btn));
+        mappings.insert(ev_code, mapped_btn.into());
         Ok(())
     }
 
@@ -401,7 +396,7 @@ impl Mapping {
             .position(|&x| x == ev_code)
             .ok_or(MappingError::InvalidCode(ev::Code(ev_code)))?;
         let _ = write!(sdl_mappings, "{}:a{},", ident, n_axis);
-        mappings.insert(ev_code, AxisOrBtn::Axis(mapped_axis));
+        mappings.insert(ev_code, mapped_axis.into());
         Ok(())
     }
 
@@ -476,8 +471,7 @@ impl MappingDb {
     pub fn add_included_mappings(&mut self) {
         self.insert(include_str!(concat!(
             env!("OUT_DIR"),
-            PATH_SEPARATOR!(),
-            "gamecontrollerdb.txt"
+            "/gamecontrollerdb.txt"
         )));
     }
 

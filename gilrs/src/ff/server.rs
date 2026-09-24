@@ -276,9 +276,14 @@ pub(crate) fn run(tx: Sender<FfMessage>, rx: Receiver<Message>) {
     }
 }
 
-pub(crate) fn init() -> (Sender<Message>, Receiver<FfMessage>) {
+pub(crate) fn init(enable: bool) -> (Sender<Message>, Receiver<FfMessage>) {
     let (tx, _rx) = mpsc::channel();
     let (_tx2, rx2) = mpsc::channel();
+
+    // Skip setup if not enabled
+    if !enable {
+        return (tx, rx2);
+    }
 
     // Wasm doesn't support threads and force feedback
     #[cfg(not(target_arch = "wasm32"))]

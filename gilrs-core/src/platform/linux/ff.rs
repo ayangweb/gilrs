@@ -6,7 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use std::fs::File;
-use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write};
+use std::io::{Error as IoError, Result as IoResult, Write};
 use std::os::unix::io::AsRawFd;
 use std::{mem, slice};
 
@@ -36,7 +36,7 @@ impl Device {
         let res = unsafe { ioctl::eviocsff(file.as_raw_fd(), &mut effect) };
 
         if res.is_err() {
-            Err(IoError::new(ErrorKind::Other, "Failed to create effect"))
+            Err(IoError::other("Failed to create effect"))
         } else {
             Ok(Device {
                 effect: effect.id,

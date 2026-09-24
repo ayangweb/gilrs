@@ -94,7 +94,7 @@ impl Gilrs {
                 let controller = raw_game_controllers
                     .GetAt(i)
                     .map_err(|e| PlatformError::Other(Box::new(e)))?;
-                Ok(Gamepad::new(i, controller))
+                Gamepad::new(i, controller)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -240,7 +240,7 @@ impl Gilrs {
         self.rx
             .try_recv()
             .ok()
-            .map(|wgi_event: WgiEvent| self.handle_event(wgi_event))
+            .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
     }
 
     pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
@@ -248,44 +248,45 @@ impl Gilrs {
             self.rx
                 .recv_timeout(timeout)
                 .ok()
-                .map(|wgi_event: WgiEvent| self.handle_event(wgi_event))
+                .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
         } else {
             self.rx
                 .recv()
                 .ok()
-                .map(|wgi_event: WgiEvent| self.handle_event(wgi_event))
+                .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
         }
     }
 
-    fn handle_event(&mut self, wgi_event: WgiEvent) -> Event {
+    fn handle_event(&mut self, wgi_event: WgiEvent) -> Option<Event> {
         // Find the index of the gamepad in our vec or insert it
-        let id = self
-            .gamepads
-            .iter()
-            .position(
-                |gamepad| match wgi_event.raw_game_controller.NonRoamableId() {
-                    Ok(id) => id == gamepad.non_roamable_id,
-                    _ => false,
-                },
-            )
-            .unwrap_or_else(|| {
-                self.gamepads.push(Gamepad::new(
-                    self.gamepads.len() as u32,
-                    wgi_event.raw_game_controller,
-                ));
-                self.gamepads.len() - 1
-            });
+        let id = match self.gamepads.iter().position(|gamepad| {
+            match wgi_event.raw_game_controller.NonRoamableId() {
+                Ok(id) => id == gamepad.non_roamable_id,
+                _ => false,
+            }
+        }) {
+            Some(id) => id,
+            None => match Gamepad::new(self.gamepads.len() as u32, wgi_event.raw_game_controller) {
+                Ok(gamepad) => {
+                    self.gamepads.push(gamepad);
+                    self.gamepads.len() - 1
+                }
+                Err(_) => {
+                    return None;
+                }
+            },
+        };
 
         match wgi_event.event {
             EventType::Connected => self.gamepads[id].is_connected = true,
             EventType::Disconnected => self.gamepads[id].is_connected = false,
             _ => (),
         }
-        Event {
+        Some(Event {
             id,
             event: wgi_event.event,
             time: wgi_event.time,
-        }
+        })
     }
 
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
@@ -539,10 +540,12 @@ pub struct Gamepad {
 }
 
 impl Gamepad {
-    fn new(id: u32, raw_game_controller: RawGameController) -> Gamepad {
+    fn new(id: u32, raw_game_controller: RawGameController) -> Result<Gamepad, PlatformError> {
         let is_connected = true;
 
-        let non_roamable_id = raw_game_controller.NonRoamableId().unwrap();
+        let non_roamable_id = raw_game_controller
+            .NonRoamableId()
+            .map_err(|e| PlatformError::Other(Box::new(e)))?;
 
         // See if we can cast this to a windows definition of a gamepad
         let wgi_gamepad = WgiGamepad::FromGameController(&raw_game_controller).ok();
@@ -599,7 +602,7 @@ impl Gamepad {
             gamepad.collect_axes_and_buttons();
         }
 
-        gamepad
+        Ok(gamepad)
     }
 
     pub fn name(&self) -> &str {

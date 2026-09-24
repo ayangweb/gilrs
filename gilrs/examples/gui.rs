@@ -265,7 +265,7 @@ impl eframe::App for MyEguiApp {
                                                         x_axis, y_axis,
                                                     ]]))
                                                     .shape(MarkerShape::Circle)
-                                                    .radius(4.0),
+                                                    .radius(4.0f32),
                                                 );
                                             });
                                     });

@@ -140,4 +140,8 @@ pub use crate::gamepad::{
     ConnectedGamepadsIterator, Error, Gamepad, GamepadId, Gilrs, GilrsBuilder, MappingSource,
     PowerInfo,
 };
+
+#[cfg(target_os = "linux")]
+pub use crate::gamepad::LinuxGamepadExt;
+
 pub use crate::mapping::{MappingData as Mapping, MappingError};

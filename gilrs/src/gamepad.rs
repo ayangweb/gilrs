@@ -148,6 +148,7 @@ pub struct Gilrs {
 impl Gilrs {
     /// Creates new `Gilrs` with default settings. See [`GilrsBuilder`](struct.GilrsBuilder.html)
     /// for more details.
+    #[allow(clippy::result_large_err)]
     pub fn new() -> Result<Self, Error> {
         GilrsBuilder::new().build()
     }
@@ -214,7 +215,7 @@ impl Gilrs {
         if let Ok(msg) = self.rx.try_recv() {
             return match msg {
                 FfMessage::EffectCompleted { event } => Some(event),
-            }
+            };
         }
         if let Some(ev) = self.events.pop_front() {
             Some(ev)
@@ -467,7 +468,7 @@ impl Gilrs {
     ///     # break;
     /// }
     /// ```
-    pub fn gamepad(&self, id: GamepadId) -> Gamepad {
+    pub fn gamepad(&self, id: GamepadId) -> Gamepad<'_> {
         Gamepad {
             inner: self.inner.gamepad(id.0).unwrap(),
             data: &self.gamepads_data[id.0],
@@ -626,6 +627,7 @@ pub struct GilrsBuilder {
     update_state: bool,
     env_mappings: bool,
     included_mappings: bool,
+    force_feedback: bool,
 }
 
 impl GilrsBuilder {
@@ -639,6 +641,7 @@ impl GilrsBuilder {
             update_state: true,
             env_mappings: true,
             included_mappings: true,
+            force_feedback: true,
         }
     }
 
@@ -647,6 +650,13 @@ impl GilrsBuilder {
     /// filters with default parameters. Defaults to `true`.
     pub fn with_default_filters(mut self, default_filters: bool) -> Self {
         self.default_filters = default_filters;
+
+        self
+    }
+
+    /// If `true`, enables force feedback support. Defaults to `true`.
+    pub fn with_force_feedback(mut self, enable_ff: bool) -> Self {
+        self.force_feedback = enable_ff;
 
         self
     }
@@ -694,6 +704,7 @@ impl GilrsBuilder {
     }
 
     /// Creates `Gilrs`.
+    #[allow(clippy::result_large_err)]
     pub fn build(mut self) -> Result<Gilrs, Error> {
         if self.included_mappings {
             self.mappings.add_included_mappings();
@@ -726,7 +737,7 @@ impl GilrsBuilder {
             Err(_) => unimplemented!(),
         };
 
-        let (tx, rx) = server::init();
+        let (tx, rx) = server::init(self.force_feedback);
 
         let mut gilrs = Gilrs {
             inner,
@@ -967,6 +978,19 @@ impl Gamepad<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use gilrs_core::LinuxGamepadExt;
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
+#[cfg(target_os = "linux")]
+impl LinuxGamepadExt for Gamepad<'_> {
+    /// Returns the device node of gamepad.
+    fn devpath(&self) -> &Path {
+        self.inner.devpath()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GamepadData {
     state: GamepadState,
@@ -992,8 +1016,8 @@ impl GamepadData {
                     Ok(result) => result,
                     Err(e) => {
                         warn!(
-                            "Unable to parse SDL mapping for UUID {uuid}\n\t{e:?}\n\tDefault mapping \
-                             will be used.",
+                            "Unable to parse SDL mapping for UUID {uuid}\n\t{e:?}\n\tDefault \
+                             mapping will be used.",
                         );
                         Mapping::default(gamepad)
                     }
@@ -1087,12 +1111,12 @@ impl GamepadData {
 
     /// Returns `Code` associated with `btn`.
     pub fn button_code(&self, btn: Button) -> Option<Code> {
-        self.mapping.map_rev(&AxisOrBtn::Btn(btn)).map(Code)
+        self.mapping.map_rev(&btn.into()).map(Code)
     }
 
     /// Returns `Code` associated with `axis`.
     pub fn axis_code(&self, axis: Axis) -> Option<Code> {
-        self.mapping.map_rev(&AxisOrBtn::Axis(axis)).map(Code)
+        self.mapping.map_rev(&axis.into()).map(Code)
     }
 }
 
@@ -1115,6 +1139,13 @@ pub enum MappingSource {
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 pub struct GamepadId(pub(crate) usize);
+
+impl GamepadId {
+    /// Returns inner value of gamepad ID.
+    pub fn into_inner(&self) -> usize {
+        self.0
+    }
+}
 
 impl From<GamepadId> for usize {
     fn from(x: GamepadId) -> usize {
@@ -1165,6 +1196,7 @@ fn btn_value(info: &AxisInfo, val: i32) -> f32 {
 /// Error type which can be returned when creating `Gilrs`.
 #[non_exhaustive]
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Error {
     /// Gilrs does not support the current platform, but you can use dummy context from this error if
     /// gamepad input is not essential.

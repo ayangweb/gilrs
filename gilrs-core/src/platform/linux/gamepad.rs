@@ -161,7 +161,11 @@ impl Gilrs {
                     Some(devpath) => devpath,
                     None => continue,
                 };
-                let syspath = Path::new(OsStr::from_bytes(dev.syspath().to_bytes()));
+                let syspath = Path::new(OsStr::from_bytes(
+                    dev.syspath()
+                        .ok_or(PlatformError::Other(Error::NullSyspath.into()))?
+                        .to_bytes(),
+                ));
                 if let Some(gamepad) = Gamepad::open(devpath, syspath, DiscoveryBackend::Udev) {
                     let idx = gamepads.len();
                     gamepad
@@ -411,7 +415,7 @@ fn handle_inotify(
 }
 
 fn get_gamepad_path(name: &str) -> Option<(PathBuf, PathBuf)> {
-    let event_id =  name.strip_prefix("event")?;
+    let event_id = name.strip_prefix("event")?;
 
     if event_id.is_empty()
         || event_id
@@ -451,8 +455,8 @@ fn handle_hotplug(sender: Sender<HotplugEvent>, monitor: Monitor, event: EventFd
             let mut sent = false;
 
             if action == cstr_new(b"add\0") {
-                if let Some(devpath) = dev.devnode() {
-                    let syspath = Path::new(OsStr::from_bytes(dev.syspath().to_bytes()));
+                if let Some((devpath, syspath)) = dev.devnode().zip(dev.syspath()) {
+                    let syspath = Path::new(OsStr::from_bytes(syspath.to_bytes()));
                     if sender
                         .send(HotplugEvent::New {
                             devpath: devpath.into(),
@@ -987,6 +991,10 @@ impl Gamepad {
         &self.name
     }
 
+    pub fn devpath(&self) -> &str {
+        &self.devpath
+    }
+
     pub fn uuid(&self) -> Uuid {
         self.uuid
     }
@@ -1122,6 +1130,7 @@ impl Display for EvCode {
 enum Error {
     UdevCtx,
     UdevEnumerate,
+    NullSyspath,
     Errno(Errno, &'static str),
 }
 
@@ -1130,6 +1139,7 @@ impl Display for Error {
         match *self {
             Error::UdevCtx => f.write_str("Failed to create udev context"),
             Error::UdevEnumerate => f.write_str("Failed to create udev enumerate object"),
+            Error::NullSyspath => f.write_str("Returned syspath was null"),
             Error::Errno(e, ctx) => f.write_fmt(format_args!("{} failed: {}", ctx, e)),
         }
     }

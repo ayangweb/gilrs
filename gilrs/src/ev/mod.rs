@@ -40,6 +40,7 @@ impl Display for Code {
 }
 
 impl Code {
+    /// Return platform-specific event code packed into a single `u32`.
     pub fn into_u32(&self) -> u32 {
         self.0.into_u32()
     }
@@ -92,9 +93,9 @@ pub enum EventType {
     ButtonRepeated(Button, Code),
     /// Previously pressed button has been released.
     ButtonReleased(Button, Code),
-    /// Value of button has changed. Value can be in range [0.0, 1.0].
+    /// Value of button has changed. Value can be in range \[0.0, 1.0\].
     ButtonChanged(Button, f32, Code),
-    /// Value of axis has changed. Value can be in range [-1.0, 1.0].
+    /// Value of axis has changed. Value can be in range \[-1.0, 1.0\].
     AxisChanged(Axis, f32, Code),
     /// Gamepad has been connected. If gamepad's UUID doesn't match one of disconnected gamepads,
     /// newly connected gamepad will get new ID.
@@ -262,5 +263,17 @@ pub enum AxisOrBtn {
 impl AxisOrBtn {
     pub(crate) fn is_button(&self) -> bool {
         matches!(self, AxisOrBtn::Btn(_))
+    }
+}
+
+impl From<Axis> for AxisOrBtn {
+    fn from(value: Axis) -> Self {
+        Self::Axis(value)
+    }
+}
+
+impl From<Button> for AxisOrBtn {
+    fn from(value: Button) -> Self {
+        Self::Btn(value)
     }
 }

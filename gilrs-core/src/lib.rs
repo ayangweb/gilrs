@@ -222,6 +222,24 @@ impl Gamepad {
     }
 }
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
+/// Linux specific extension to `Gamepad`.
+#[cfg(target_os = "linux")]
+pub trait LinuxGamepadExt {
+    /// Returns the device node of gamepad.
+    fn devpath(&self) -> &Path;
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxGamepadExt for Gamepad {
+    /// Returns the device node of gamepad.
+    fn devpath(&self) -> &Path {
+        Path::new(self.inner.devpath())
+    }
+}
+
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 
@@ -232,6 +250,7 @@ use serde::{Deserialize, Serialize};
 pub struct EvCode(platform::EvCode);
 
 impl EvCode {
+    /// Return platform-specific event code packed into a single `u32`.
     pub fn into_u32(self) -> u32 {
         self.0.into_u32()
     }

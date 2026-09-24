@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::ev::{Axis, AxisOrBtn, Button};
 
 // Must be sorted!
-static AXES_SDL: [&str; 31] = [
+static AXES_SDL: [&str; 35] = [
     "a",
     "b",
     "back",
@@ -29,6 +29,10 @@ static AXES_SDL: [&str; 31] = [
     "lefty",
     "leftz",
     "misc1",
+    "misc2",
+    "misc3",
+    "misc4",
+    "misc5",
     "paddle1",
     "paddle2",
     "paddle3",
@@ -45,7 +49,7 @@ static AXES_SDL: [&str; 31] = [
     "y",
     "z",
 ];
-static AXES: [AxisOrBtn; 31] = [
+static AXES: [AxisOrBtn; 35] = [
     AxisOrBtn::Btn(Button::South),
     AxisOrBtn::Btn(Button::East),
     AxisOrBtn::Btn(Button::Select),
@@ -61,6 +65,10 @@ static AXES: [AxisOrBtn; 31] = [
     AxisOrBtn::Axis(Axis::LeftStickX),
     AxisOrBtn::Axis(Axis::LeftStickY),
     AxisOrBtn::Axis(Axis::LeftZ),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
     AxisOrBtn::Btn(Button::Unknown),
     AxisOrBtn::Btn(Button::Unknown),
     AxisOrBtn::Btn(Button::Unknown),
@@ -380,16 +388,11 @@ impl Display for Error {
 #[cfg(test)]
 mod tests {
     use crate::mapping::parser::{ErrorKind, Parser};
-    use crate::utils::PATH_SEPARATOR;
 
     #[test]
     fn test_all_sdl_mappings_for_parse_errors() {
-        let included_mappings = include_str!(concat!(
-            env!("OUT_DIR"),
-            PATH_SEPARATOR!(),
-            "gamecontrollerdb.txt"
-        ))
-        .lines();
+        let included_mappings =
+            include_str!(concat!(env!("OUT_DIR"), "/gamecontrollerdb.txt")).lines();
 
         let mut errors = 0;
         let mut index = 0;

@@ -176,7 +176,7 @@ impl ButtonData {
         self.is_pressed
     }
 
-    /// Returns value of button.
+    /// Returns value of button. Value can be in the range \[0.0, 1.0\].
     pub fn value(&self) -> f32 {
         self.value
     }
@@ -213,7 +213,7 @@ impl AxisData {
             value,
         }
     }
-    /// Returns value of axis.
+    /// Returns value of axis. Value can be in the range \[-1.0, 1.0\].
     pub fn value(&self) -> f32 {
         self.value
     }
