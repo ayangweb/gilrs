@@ -130,6 +130,61 @@ const DEFAULT_DEADZONE: f32 = 0.1;
 /// #   break;
 /// }
 ///
+const MAX_PENDING_EVENTS: usize = 1024;
+
+#[derive(Debug)]
+struct PendingEvents {
+    events: VecDeque<Event>,
+    overflow: Option<u64>,
+    capacity: usize,
+}
+
+impl PendingEvents {
+    fn new() -> Self {
+        Self::with_capacity(MAX_PENDING_EVENTS)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "pending event capacity must be non-zero");
+        Self {
+            events: VecDeque::with_capacity(capacity),
+            overflow: None,
+            capacity,
+        }
+    }
+
+    fn push(&mut self, event: Event) {
+        if let Some(pending) = self.overflow.as_mut() {
+            *pending = pending.saturating_add(1);
+            return;
+        }
+
+        if self.events.len() >= self.capacity {
+            let dropped = self.events.len() as u64 + 1;
+            self.events.clear();
+            self.overflow = Some(dropped);
+            return;
+        }
+
+        self.events.push_back(event);
+    }
+
+    fn pop(&mut self) -> Option<Event> {
+        if let Some(dropped) = self.overflow.take() {
+            return Some(Event::new(
+                GamepadId(0),
+                EventType::BackendOverflow { dropped },
+            ));
+        }
+        self.events.pop_front()
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.overflow = None;
+    }
+}
+
 #[derive(Debug)]
 pub struct Gilrs {
     inner: gilrs_core::Gilrs,
@@ -139,7 +194,7 @@ pub struct Gilrs {
     counter: u64,
     mappings: MappingDb,
     default_filters: bool,
-    events: VecDeque<Event>,
+    events: PendingEvents,
     axis_to_btn_pressed: f32,
     axis_to_btn_released: f32,
     pub(crate) update_state: bool,
@@ -183,6 +238,7 @@ impl Gilrs {
 
     /// Purges queued input and asks the backend to re-emit its current state.
     pub fn reset(&mut self) -> Result<(), ResetError> {
+        self.events.clear();
         for gamepad in &mut self.gamepads_data {
             gamepad.state = crate::ev::state::GamepadState::new();
         }
@@ -235,7 +291,12 @@ impl Gilrs {
                 FfMessage::EffectCompleted { event } => Some(event),
             };
         }
-        if let Some(ev) = self.events.pop_front() {
+        if let Some(ev) = self.events.pop() {
+            if matches!(ev.event, EventType::BackendOverflow { .. }) {
+                if let Err(error) = self.reset() {
+                    warn!("Pending event recovery reset failed: {error}");
+                }
+            }
             Some(ev)
         } else {
             let event = if is_blocking {
@@ -259,7 +320,7 @@ impl Gilrs {
                             let nec = Code(nec);
                             match self.gamepad(id).axis_or_btn_name(nec) {
                                 Some(AxisOrBtn::Btn(b)) => {
-                                    self.events.push_back(Event {
+                                    self.events.push(Event {
                                         id,
                                         time,
                                         event: EventType::ButtonChanged(b, 1.0, nec),
@@ -269,7 +330,7 @@ impl Gilrs {
                                 }
                                 Some(AxisOrBtn::Axis(a)) => EventType::AxisChanged(a, 1.0, nec),
                                 None => {
-                                    self.events.push_back(Event {
+                                    self.events.push(Event {
                                         id,
                                         time,
                                         event: EventType::ButtonChanged(Button::Unknown, 1.0, nec),
@@ -283,7 +344,7 @@ impl Gilrs {
                             let nec = Code(nec);
                             match self.gamepad(id).axis_or_btn_name(nec) {
                                 Some(AxisOrBtn::Btn(b)) => {
-                                    self.events.push_back(Event {
+                                    self.events.push(Event {
                                         id,
                                         time,
                                         event: EventType::ButtonChanged(b, 0.0, nec),
@@ -293,7 +354,7 @@ impl Gilrs {
                                 }
                                 Some(AxisOrBtn::Axis(a)) => EventType::AxisChanged(a, 0.0, nec),
                                 None => {
-                                    self.events.push_back(Event {
+                                    self.events.push(Event {
                                         id,
                                         time,
                                         event: EventType::ButtonChanged(Button::Unknown, 0.0, nec),
@@ -315,7 +376,7 @@ impl Gilrs {
                                     if val >= self.axis_to_btn_pressed
                                         && !self.gamepad(id).state().is_pressed(nec)
                                     {
-                                        self.events.push_back(Event {
+                                        self.events.push(Event {
                                             id,
                                             time,
                                             event: EventType::ButtonChanged(b, val, nec),
@@ -325,7 +386,7 @@ impl Gilrs {
                                     } else if val <= self.axis_to_btn_released
                                         && self.gamepad(id).state().is_pressed(nec)
                                     {
-                                        self.events.push_back(Event {
+                                        self.events.push(Event {
                                             id,
                                             time,
                                             event: EventType::ButtonChanged(b, val, nec),
@@ -536,7 +597,7 @@ impl Gilrs {
 
     /// Adds `ev` at the end of internal event queue. It can later be retrieved with `next_event()`.
     pub fn insert_event(&mut self, ev: Event) {
-        self.events.push_back(ev);
+        self.events.push(ev);
     }
 
     pub(crate) fn ff_sender(&self) -> &Sender<Message> {
@@ -775,7 +836,7 @@ impl GilrsBuilder {
             counter: 0,
             mappings: self.mappings,
             default_filters: self.default_filters,
-            events: VecDeque::new(),
+            events: PendingEvents::new(),
             axis_to_btn_pressed: self.axis_to_btn_pressed,
             axis_to_btn_released: self.axis_to_btn_released,
             update_state: self.update_state,
@@ -1265,7 +1326,9 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::{axis_value, btn_value, Axis, AxisInfo};
+    use super::{
+        axis_value, btn_value, Axis, AxisInfo, Event, EventType, GamepadId, PendingEvents,
+    };
 
     #[test]
     fn axis_value_documented_case() {
@@ -1302,6 +1365,24 @@ mod tests {
         let y_max = -y_min;
         assert_eq!(y_min, axis_value(&info, i32::MIN, Axis::LeftStickY));
         assert_eq!(y_max, axis_value(&info, i32::MAX, Axis::LeftStickY));
+    }
+
+    #[test]
+    fn pending_events_are_bounded_and_report_overflow() {
+        let mut pending = PendingEvents::with_capacity(2);
+        pending.push(Event::new(GamepadId(0), EventType::Connected));
+        pending.push(Event::new(GamepadId(0), EventType::Disconnected));
+        pending.push(Event::new(GamepadId(0), EventType::Connected));
+        pending.push(Event::new(GamepadId(0), EventType::Disconnected));
+
+        assert!(matches!(
+            pending.pop(),
+            Some(Event {
+                event: EventType::BackendOverflow { dropped: 4 },
+                ..
+            })
+        ));
+        assert!(pending.pop().is_none());
     }
 
     #[test]
