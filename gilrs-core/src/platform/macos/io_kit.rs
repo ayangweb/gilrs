@@ -21,11 +21,12 @@ use objc2_io_kit::{
     kHIDUsage_Sim_Throttle, kIOHIDDeviceUsageKey, kIOHIDDeviceUsagePageKey, kIOHIDLocationIDKey,
     kIOHIDOptionsTypeNone, kIOHIDPrimaryUsageKey, kIOHIDPrimaryUsagePageKey, kIOHIDProductIDKey,
     kIOHIDProductKey, kIOHIDVendorIDKey, kIOHIDVersionNumberKey, kIOReturnSuccess, IOHIDDevice,
-    IOHIDElement, IOHIDElementType, IOHIDManager, IOObjectRelease, IOObjectRetain,
+    IOHIDElement, IOHIDElementType, IOHIDManager, IOHIDValue, IOObjectRelease, IOObjectRetain,
     IORegistryEntryGetRegistryEntryID, IO_OBJECT_NULL,
 };
 
 use std::ffi::CStr;
+use std::ptr::NonNull;
 
 pub fn new_manager() -> Option<CFRetained<IOHIDManager>> {
     let manager = IOHIDManager::new(None, kIOHIDOptionsTypeNone);
@@ -95,6 +96,24 @@ pub trait DeviceExt: Properties {
     fn get_service(&self) -> Option<IOService> {
         IOService::new(self.device().service())
     }
+}
+
+pub fn device_value(
+    device: &IOHIDDevice,
+    element: &IOHIDElement,
+) -> Option<CFRetained<IOHIDValue>> {
+    extern "C" {
+        fn IOHIDDeviceGetValue(
+            device: &IOHIDDevice,
+            element: &IOHIDElement,
+        ) -> Option<NonNull<IOHIDValue>>;
+    }
+
+    // SAFETY: IOHIDDeviceGetValue accepts the retained device and element
+    // references supplied by the caller and returns a retained IOHIDValueRef.
+    let value = unsafe { IOHIDDeviceGetValue(device, element) }?;
+    // SAFETY: The returned pointer follows the CF retain contract above.
+    Some(unsafe { CFRetained::from_raw(value) })
 }
 
 pub fn device_elements(device: &IOHIDDevice) -> Vec<CFRetained<IOHIDElement>> {

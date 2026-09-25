@@ -16,7 +16,7 @@ use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRetained, CFRunLoop, Type};
 use objc2_io_kit::{
     kHIDPage_GenericDesktop, kHIDPage_VendorDefinedStart, kHIDUsage_GD_GamePad,
     kHIDUsage_GD_Joystick, kHIDUsage_GD_MultiAxisController, kIOHIDOptionsTypeNone,
-    kIOReturnSuccess, IOHIDDevice, IOHIDElement, IOHIDValue, IOReturn,
+    kIOReturnSuccess, IOHIDDevice, IOHIDElement, IOHIDManager, IOHIDValue, IOReturn,
 };
 use uuid::Uuid;
 use vec_map::VecMap;
@@ -119,7 +119,10 @@ impl Gilrs {
 
         // Keep one owned callback context alive for the entire IOHID run-loop
         // lifetime. The previous code registered pointers to temporary tuples.
-        let context = Arc::new(Context { tx, device_infos });
+        let context = Arc::new(Context {
+            tx: tx.clone(),
+            device_infos: device_infos.clone(),
+        });
         // SAFETY: `context` is owned by this function and remains alive until
         // after the run loop has stopped and the manager has been closed.
         let context_ptr = Arc::as_ptr(&context) as *mut c_void;
@@ -135,7 +138,10 @@ impl Gilrs {
             match control_rx.try_recv() {
                 Ok(Control::Stop) | Err(TryRecvError::Disconnected) => break,
                 Ok(Control::Reset(ack)) => {
-                    let _ = ack.send(Ok(()));
+                    let epoch = tx.epoch();
+                    let result = snapshot_devices(&manager, &device_infos, &tx, epoch)
+                        .map_err(|_| ResetError::WorkerFailed);
+                    let _ = ack.send(result);
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -786,6 +792,54 @@ pub mod native_ev_codes {
     };
 }
 
+fn snapshot_devices(
+    manager: &IOHIDManager,
+    device_infos: &Arc<Mutex<Vec<DeviceInfo>>>,
+    tx: &EventSender<(Event, Option<Device>)>,
+    epoch: u64,
+) -> Result<(), WorkerExit> {
+    let Some(devices) = manager.devices() else {
+        return Ok(());
+    };
+    let count = usize::try_from(devices.count()).map_err(|_| WorkerExit::Failed)?;
+    let mut raw_devices = vec![std::ptr::null(); count];
+    // SAFETY: CFSetGetValues fills the buffer with pointers owned by `devices`,
+    // which remains alive for the duration of this function.
+    unsafe { devices.values(raw_devices.as_mut_ptr()) };
+
+    for raw_device in raw_devices {
+        let Some(device) = (unsafe { raw_device.cast::<IOHIDDevice>().as_ref() }) else {
+            continue;
+        };
+        let Some(service) = IOService::new(device.service()) else {
+            continue;
+        };
+        let Some(entry_id) = service.get_registry_entry_id() else {
+            continue;
+        };
+        let id = {
+            let infos = device_infos.lock().unwrap();
+            let Some(id) = infos
+                .iter()
+                .position(|info| info.entry_id == entry_id && info.is_connected)
+            else {
+                continue;
+            };
+            id
+        };
+
+        let mut elements = Vec::new();
+        collect_snapshot_elements(device_elements(device), &mut elements);
+        for element in elements {
+            if let Some(value) = device_value(device, &element) {
+                emit_value_event(id, &value, tx, epoch);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 struct Context {
     tx: EventSender<(Event, Option<Device>)>,
     device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
@@ -813,6 +867,110 @@ fn send_context_event(
     };
     if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
         warn!("macOS IOHID event queue rejected an event: {result:?}");
+    }
+}
+
+fn collect_snapshot_elements(
+    elements: Vec<CFRetained<IOHIDElement>>,
+    output: &mut Vec<CFRetained<IOHIDElement>>,
+) {
+    for element in elements {
+        if element_is_collection(element.r#type()) {
+            collect_snapshot_elements(element_children(&element), output);
+        } else {
+            output.push(element);
+        }
+    }
+}
+
+fn emit_value_event(
+    id: usize,
+    value: &IOHIDValue,
+    tx: &EventSender<(Event, Option<Device>)>,
+    epoch: u64,
+) {
+    let element = value.element();
+    let type_ = element.r#type();
+    let page = element.usage_page();
+    let usage = element.usage();
+
+    if element_is_axis(type_, page, usage) {
+        send_context_event(
+            tx,
+            epoch,
+            Event::new(
+                id,
+                EventType::AxisValueChanged(
+                    value.integer_value() as i32,
+                    crate::EvCode(EvCode { page, usage }),
+                ),
+            ),
+            None,
+            true,
+        );
+    } else if element_is_button(type_, page, usage) {
+        let event = if value.integer_value() == 0 {
+            Event::new(
+                id,
+                EventType::ButtonReleased(crate::EvCode(EvCode { page, usage })),
+            )
+        } else {
+            Event::new(
+                id,
+                EventType::ButtonPressed(crate::EvCode(EvCode { page, usage })),
+            )
+        };
+        send_context_event(tx, epoch, event, None, false);
+    } else if element_is_hat(type_, page, usage) {
+        let range = element.logical_max() - element.logical_min() + 1;
+        let shifted_value = value.integer_value() - element.logical_min();
+        let dpad_value = match range {
+            4 => shifted_value * 2,
+            8 => shifted_value,
+            _ => -1,
+        };
+        let x_axis_value = match dpad_value {
+            5..=7 => -1,
+            1..=3 => 1,
+            _ => 0,
+        };
+        let y_axis_value = match dpad_value {
+            3..=5 => 1,
+            0 | 1 | 7 => -1,
+            _ => 0,
+        };
+        send_context_event(
+            tx,
+            epoch,
+            Event::new(
+                id,
+                EventType::AxisValueChanged(
+                    x_axis_value,
+                    crate::EvCode(EvCode {
+                        page,
+                        usage: USAGE_AXIS_DPADX,
+                    }),
+                ),
+            ),
+            None,
+            true,
+        );
+        send_context_event(
+            tx,
+            epoch,
+            Event::new(
+                id,
+                EventType::AxisValueChanged(
+                    y_axis_value,
+                    crate::EvCode(EvCode {
+                        page,
+                        usage: USAGE_AXIS_DPADY,
+                    }),
+                ),
+            ),
+            None,
+            true,
+        );
     }
 }
 
@@ -992,99 +1150,5 @@ unsafe extern "C-unwind" fn input_value_cb(
         }
     };
 
-    let element = value.element();
-
-    let type_ = element.r#type();
-    let page = element.usage_page();
-    let usage = element.usage();
-
-    if element_is_axis(type_, page, usage) {
-        let event = Event::new(
-            id,
-            EventType::AxisValueChanged(
-                value.integer_value() as i32,
-                crate::EvCode(EvCode { page, usage }),
-            ),
-        );
-        send_context_event(tx, epoch, event, None, true);
-    } else if element_is_button(type_, page, usage) {
-        if value.integer_value() == 0 {
-            let event = Event::new(
-                id,
-                EventType::ButtonReleased(crate::EvCode(EvCode { page, usage })),
-            );
-            send_context_event(tx, epoch, event, None, false);
-        } else {
-            let event = Event::new(
-                id,
-                EventType::ButtonPressed(crate::EvCode(EvCode { page, usage })),
-            );
-            send_context_event(tx, epoch, event, None, false);
-        }
-    } else if element_is_hat(type_, page, usage) {
-        // Hat switch values are reported with a range of usually 8 numbers (sometimes 4). The logic
-        // below uses the reported min/max values of that range to map that onto a range of 0-7 for
-        // the directions (and any other value indicates the center position). Lucky for us, they
-        // always start with "up" as the lowest number and proceed clockwise. See similar handling
-        // here https://github.com/spurious/SDL-mirror/blob/094b2f68dd7fc9af167f905e10625e103a131459/src/joystick/darwin/SDL_sysjoystick.c#L976-L1028
-        //
-        //          up
-        //       7  0  1
-        //        \ | /
-        // left 6 - ? - 2 right       (After mapping)
-        //        / | \
-        //       5  4  3
-        //         down
-        let range = element.logical_max() - element.logical_min() + 1;
-        let shifted_value = value.integer_value() - element.logical_min();
-        let dpad_value = match range {
-            4 => shifted_value * 2, // 4-position hat switch - scale it up to 8
-            8 => shifted_value,     // 8-position hat switch - no adjustment necessary
-            _ => -1, // Neither 4 nor 8 positions, we don't know what to do - default to centered
-        };
-        // At this point, the value should be normalized to the 0-7 directional values (or center
-        // for any other value). The dpad is a hat switch on macOS, but on other platforms dpads are
-        // either buttons or a pair of axes that get converted to button events by the
-        // `axis_dpad_to_button` filter.  We will emulate axes here and let that filter do the
-        // button conversion, because it is safer and easier than making separate logic for button
-        // conversion that may diverge in subtle ways from the axis conversion logic.  The most
-        // practical outcome of this conversion is that there are extra "released" axis events for
-        // the unused axis. For example, pressing just "up" will also give you a "released" event
-        // for either the left or right button, even if it wasn't pressed before pressing "up".
-        let x_axis_value = match dpad_value {
-            5..=7 => -1, // left
-            1..=3 => 1,  // right
-            _ => 0,
-        };
-        // Since we're emulating an inverted macOS gamepad axis, down is positive and up is negative
-        let y_axis_value = match dpad_value {
-            3..=5 => 1,      // down
-            0 | 1 | 7 => -1, // up
-            _ => 0,
-        };
-
-        let x_axis_event = Event::new(
-            id,
-            EventType::AxisValueChanged(
-                x_axis_value,
-                crate::EvCode(EvCode {
-                    page,
-                    usage: USAGE_AXIS_DPADX,
-                }),
-            ),
-        );
-        let y_axis_event = Event::new(
-            id,
-            EventType::AxisValueChanged(
-                y_axis_value,
-                crate::EvCode(EvCode {
-                    page,
-                    usage: USAGE_AXIS_DPADY,
-                }),
-            ),
-        );
-
-        send_context_event(tx, epoch, x_axis_event, None, true);
-        send_context_event(tx, epoch, y_axis_event, None, true);
-    }
+    emit_value_event(id, value, tx, epoch);
 }
