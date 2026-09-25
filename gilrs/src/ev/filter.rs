@@ -258,6 +258,9 @@ pub fn axis_dpad_to_button(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event
     }
 
     let ev = ev?;
+    if matches!(ev.event, EventType::BackendOverflow { .. }) {
+        return Some(ev);
+    }
     let gamepad = gilrs.gamepad(ev.id);
 
     if !can_map(&gamepad) {
