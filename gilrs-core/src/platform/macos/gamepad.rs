@@ -69,21 +69,26 @@ impl Gilrs {
                 // callback will be run on this thread below.
                 unsafe { manager.schedule_with_run_loop(&rl, kCFRunLoopDefaultMode.unwrap()) };
 
-                // SAFETY: The contexts pointer is a valid pointer.
-                let context = &(tx.clone(), device_infos.clone()) as *const Context as *mut c_void;
+                // Keep one owned callback context alive for the entire IOHID run-loop
+                // lifetime. The previous code registered pointers to temporary tuples.
+                let context = Arc::new(Context {
+                    tx: tx.clone(),
+                    device_infos: device_infos.clone(),
+                });
+                // SAFETY: `context` is owned by this closure and remains alive until
+                // after the run loop has stopped and callbacks have been unregistered.
+                let context_ptr = Arc::as_ptr(&context) as *mut c_void;
                 unsafe {
-                    manager.register_device_matching_callback(Some(device_matching_cb), context)
+                    manager.register_device_matching_callback(Some(device_matching_cb), context_ptr)
                 };
 
                 // SAFETY: Same as above.
-                let context = &(tx.clone(), device_infos.clone()) as *const Context as *mut c_void;
                 unsafe {
-                    manager.register_device_removal_callback(Some(device_removal_cb), context)
+                    manager.register_device_removal_callback(Some(device_removal_cb), context_ptr)
                 };
 
                 // SAFETY: Same as above.
-                let context = &(tx, device_infos) as *const Context as *mut c_void;
-                unsafe { manager.register_input_value_callback(Some(input_value_cb), context) };
+                unsafe { manager.register_input_value_callback(Some(input_value_cb), context_ptr) };
 
                 CFRunLoop::run();
 
@@ -629,7 +634,10 @@ pub mod native_ev_codes {
     };
 }
 
-type Context = (Sender<(Event, Option<Device>)>, Arc<Mutex<Vec<DeviceInfo>>>);
+struct Context {
+    tx: Sender<(Event, Option<Device>)>,
+    device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
+}
 
 extern "C-unwind" fn device_matching_cb(
     context: *mut c_void,
@@ -640,7 +648,9 @@ extern "C-unwind" fn device_matching_cb(
     // SAFETY: Validity of the pointer is upheld by the caller.
     let device = unsafe { device.as_ref() };
     // SAFETY: The context is the one we passed in `Gilrs::spawn_thread`.
-    let (tx, device_infos): &Context = unsafe { &*(context as *mut _) };
+    let context = unsafe { &*(context as *const Context) };
+    let tx = &context.tx;
+    let device_infos = &context.device_infos;
 
     let io_service = match IOService::new(device.service()) {
         Some(io_service) => io_service,
@@ -715,7 +725,9 @@ unsafe extern "C-unwind" fn device_removal_cb(
     // SAFETY: Validity of the pointer is upheld by the caller.
     let device = unsafe { device.as_ref() };
     // SAFETY: The context is the one we passed in `Gilrs::spawn_thread`.
-    let (tx, device_infos): &Context = unsafe { &*(context as *mut _) };
+    let context = unsafe { &*(context as *const Context) };
+    let tx = &context.tx;
+    let device_infos = &context.device_infos;
 
     let location_id = match device.get_location_id() {
         Some(location_id) => location_id,
@@ -750,7 +762,9 @@ unsafe extern "C-unwind" fn input_value_cb(
     // SAFETY: Validity of the pointer is upheld by the caller.
     let value = unsafe { value.as_ref() };
     // SAFETY: The context is the one we passed in `Gilrs::spawn_thread`.
-    let (tx, device_infos): &Context = unsafe { &*(context as *mut _) };
+    let context = unsafe { &*(context as *const Context) };
+    let tx = &context.tx;
+    let device_infos = &context.device_infos;
 
     // SAFETY: TODO.
     let device = match unsafe { sender.cast::<IOHIDDevice>().as_ref() } {
