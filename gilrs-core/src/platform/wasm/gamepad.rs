@@ -187,6 +187,10 @@ impl Gilrs {
         Ok(())
     }
 
+    pub(crate) fn reset(&mut self) -> Result<(), crate::ResetError> {
+        Ok(())
+    }
+
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
         self.gamepads.get(id)
     }

@@ -221,6 +221,10 @@ impl Gilrs {
         Ok(())
     }
 
+    pub(crate) fn reset(&mut self) -> Result<(), crate::ResetError> {
+        Ok(())
+    }
+
     fn next_event_impl(&mut self, timeout: Option<Duration>) -> Option<Event> {
         let mut check_hotplug = false;
 

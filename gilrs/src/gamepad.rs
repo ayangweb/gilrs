@@ -20,7 +20,7 @@ use crate::{
 
 use gilrs_core::{
     self, AxisInfo, Error as PlatformError, Event as RawEvent, EventType as RawEventType,
-    ShutdownError,
+    ResetError, ShutdownError,
 };
 
 use uuid::Uuid;
@@ -179,6 +179,14 @@ impl Gilrs {
     /// worker panic, or platform cleanup failure.
     pub fn shutdown(mut self) -> Result<(), ShutdownError> {
         self.inner.shutdown()
+    }
+
+    /// Purges queued input and asks the backend to re-emit its current state.
+    pub fn reset(&mut self) -> Result<(), ResetError> {
+        for gamepad in &mut self.gamepads_data {
+            gamepad.state = crate::ev::state::GamepadState::new();
+        }
+        self.inner.reset()
     }
 
     fn next_event_inner(
@@ -374,6 +382,9 @@ impl Gilrs {
                             EventType::Disconnected
                         }
                         RawEventType::Overflow { dropped } => {
+                            for gamepad in &mut self.gamepads_data {
+                                gamepad.state = crate::ev::state::GamepadState::new();
+                            }
                             EventType::BackendOverflow { dropped }
                         }
                         _ => {

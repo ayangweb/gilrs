@@ -9,13 +9,13 @@ use super::FfDevice;
 use crate::event_queue::{
     bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
 };
-use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
+use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ResetError, ShutdownError};
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
-    mpsc::{self, Receiver, Sender, TryRecvError},
+    mpsc::{self, Receiver, SyncSender, TryRecvError},
     Arc,
 };
 use std::thread::JoinHandle;
@@ -47,13 +47,19 @@ enum WorkerExit {
     StopSignalFailed,
 }
 
+#[derive(Debug)]
+enum Control {
+    Stop,
+    Reset(SyncSender<Result<(), ResetError>>),
+}
+
 const MAX_XINPUT_CONTROLLERS: usize = 4;
 
 #[derive(Debug)]
 pub struct Gilrs {
     gamepads: [Gamepad; MAX_XINPUT_CONTROLLERS],
     rx: EventReceiver<Event>,
-    stop_tx: Option<Sender<()>>,
+    control_tx: Option<SyncSender<Control>>,
     join_handle: Option<JoinHandle<()>>,
     completion: Option<Receiver<WorkerExit>>,
 }
@@ -78,15 +84,15 @@ impl Gilrs {
         }
 
         let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
-        let (stop_tx, stop_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::sync_channel(1);
         let (join_handle, completion) =
-            Self::spawn_thread(tx, connected, xinput_handle.clone(), stop_rx)?;
+            Self::spawn_thread(tx, connected, xinput_handle.clone(), control_rx)?;
 
         // Coerce gamepads vector to slice
         Ok(Gilrs {
             gamepads,
             rx,
-            stop_tx: Some(stop_tx),
+            control_tx: Some(control_tx),
             join_handle: Some(join_handle),
             completion: Some(completion),
         })
@@ -109,7 +115,12 @@ impl Gilrs {
     fn handle_queue_item(&mut self, item: QueueItem<Event>) -> Event {
         match item {
             QueueItem::Event(event) => event,
-            QueueItem::Overflow { dropped } => Event::new(0, EventType::Overflow { dropped }),
+            QueueItem::Overflow { dropped } => {
+                if let Err(error) = self.reset() {
+                    warn!("XInput recovery after queue overflow failed: {error:?}");
+                }
+                Event::new(0, EventType::Overflow { dropped })
+            }
         }
     }
 
@@ -122,15 +133,31 @@ impl Gilrs {
         })
     }
 
+    pub(crate) fn reset(&mut self) -> Result<(), ResetError> {
+        self.rx.advance_epoch();
+        let Some(control_tx) = self.control_tx.as_ref() else {
+            return Err(ResetError::BackendUnavailable);
+        };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        control_tx
+            .send(Control::Reset(ack_tx))
+            .map_err(|_| ResetError::BackendUnavailable)?;
+        match ack_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ResetError::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ResetError::WorkerFailed),
+        }
+    }
+
     fn stop_and_join(&mut self) -> Result<(), WorkerExit> {
         let Some(join_handle) = self.join_handle.take() else {
             return Ok(());
         };
 
         let stop_result = self
-            .stop_tx
+            .control_tx
             .take()
-            .map(|stop_tx| stop_tx.send(()))
+            .map(|control_tx| control_tx.send(Control::Stop))
             .unwrap_or(Ok(()));
         let completion = self
             .completion
@@ -192,14 +219,14 @@ impl Gilrs {
         tx: EventSender<Event>,
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
-        stop_rx: Receiver<()>,
+        control_rx: Receiver<Control>,
     ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
         let (completion_tx, completion) = mpsc::sync_channel(1);
         let join_handle = std::thread::Builder::new()
             .name("gilrs".to_owned())
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-                    Self::run_worker(tx, connected, xinput_handle, stop_rx)
+                    Self::run_worker(tx, connected, xinput_handle, control_rx)
                 }));
                 let exit = if result.is_ok() {
                     WorkerExit::Stopped
@@ -218,7 +245,7 @@ impl Gilrs {
         tx: EventSender<Event>,
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
-        stop_rx: Receiver<()>,
+        control_rx: Receiver<Control>,
     ) {
         // Issue #70 fix - Maintain a prev_state per controller id. Otherwise the loop will
         // compare the prev_state of a different controller.
@@ -226,34 +253,56 @@ impl Gilrs {
             [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
         let mut connected = connected;
         let mut counter = 0;
+        let mut force_snapshot = false;
 
         loop {
-            match stop_rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => break,
+            match control_rx.try_recv() {
+                Ok(Control::Stop) | Err(TryRecvError::Disconnected) => break,
+                Ok(Control::Reset(ack)) => {
+                    prev_states = [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
+                    force_snapshot = true;
+                    let _ = ack.send(Ok(()));
+                }
                 Err(TryRecvError::Empty) => {}
             }
+            let epoch = tx.epoch();
             for id in 0..MAX_XINPUT_CONTROLLERS {
-                if *connected.get_unchecked(id) || counter % ITERATIONS_TO_CHECK_IF_CONNECTED == 0 {
+                if force_snapshot
+                    || *connected.get_unchecked(id)
+                    || counter % ITERATIONS_TO_CHECK_IF_CONNECTED == 0
+                {
                     match xinput_handle.get_state(id as u32) {
                         Ok(XInputState { raw: state }) => {
                             if !connected[id] {
                                 connected[id] = true;
-                                Self::send_xinput_event(&tx, Event::new(id, EventType::Connected));
+                                Self::send_xinput_event(
+                                    &tx,
+                                    epoch,
+                                    Event::new(id, EventType::Connected),
+                                );
                             }
 
-                            if state.dwPacketNumber != prev_states[id].dwPacketNumber {
+                            if force_snapshot
+                                || state.dwPacketNumber != prev_states[id].dwPacketNumber
+                            {
                                 Self::compare_state(
                                     id,
                                     &state.Gamepad,
                                     &prev_states[id].Gamepad,
                                     &tx,
+                                    epoch,
+                                    force_snapshot,
                                 );
                                 prev_states[id] = state;
                             }
                         }
                         Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
                             connected[id] = false;
-                            Self::send_xinput_event(&tx, Event::new(id, EventType::Disconnected));
+                            Self::send_xinput_event(
+                                &tx,
+                                epoch,
+                                Event::new(id, EventType::Disconnected),
+                            );
                         }
                         Err(XInputUsageError::DeviceNotConnected) => (),
                         Err(e) => error!("Failed to get gamepad state: {:?}", e),
@@ -261,30 +310,45 @@ impl Gilrs {
                 }
             }
 
+            force_snapshot = false;
             counter = counter.wrapping_add(1);
             thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
         }
     }
 
-    fn send_xinput_event(tx: &EventSender<Event>, event: Event) {
-        let result = tx.push(event);
+    fn send_xinput_event(tx: &EventSender<Event>, epoch: u64, event: Event) {
+        let result = tx.push_with_epoch(epoch, event);
         if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
             warn!("XInput event queue rejected an event: {result:?}");
         }
     }
 
-    fn send_xinput_axis_event(tx: &EventSender<Event>, id: usize, code: u32, event: Event) {
+    fn send_xinput_axis_event(
+        tx: &EventSender<Event>,
+        epoch: u64,
+        id: usize,
+        code: u32,
+        event: Event,
+    ) {
         let key = ((id as u64) << 32) | code as u64;
-        let result = tx.push_latest(key, event);
+        let result = tx.push_latest_with_epoch(epoch, key, event);
         if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
             warn!("XInput axis queue rejected an event: {result:?}");
         }
     }
 
-    fn compare_state(id: usize, g: &XGamepad, pg: &XGamepad, tx: &EventSender<Event>) {
-        if g.bLeftTrigger != pg.bLeftTrigger {
+    fn compare_state(
+        id: usize,
+        g: &XGamepad,
+        pg: &XGamepad,
+        tx: &EventSender<Event>,
+        epoch: u64,
+        force: bool,
+    ) {
+        if force || g.bLeftTrigger != pg.bLeftTrigger {
             Self::send_xinput_axis_event(
                 tx,
+                epoch,
                 id,
                 crate::native_ev_codes::AXIS_LT2.into_u32(),
                 Event::new(
@@ -296,9 +360,10 @@ impl Gilrs {
                 ),
             );
         }
-        if g.bRightTrigger != pg.bRightTrigger {
+        if force || g.bRightTrigger != pg.bRightTrigger {
             Self::send_xinput_axis_event(
                 tx,
+                epoch,
                 id,
                 crate::native_ev_codes::AXIS_RT2.into_u32(),
                 Event::new(
@@ -310,9 +375,10 @@ impl Gilrs {
                 ),
             );
         }
-        if g.sThumbLX != pg.sThumbLX {
+        if force || g.sThumbLX != pg.sThumbLX {
             Self::send_xinput_axis_event(
                 tx,
+                epoch,
                 id,
                 crate::native_ev_codes::AXIS_LSTICKX.into_u32(),
                 Event::new(
@@ -324,9 +390,10 @@ impl Gilrs {
                 ),
             );
         }
-        if g.sThumbLY != pg.sThumbLY {
+        if force || g.sThumbLY != pg.sThumbLY {
             Self::send_xinput_axis_event(
                 tx,
+                epoch,
                 id,
                 crate::native_ev_codes::AXIS_LSTICKY.into_u32(),
                 Event::new(
@@ -338,9 +405,10 @@ impl Gilrs {
                 ),
             );
         }
-        if g.sThumbRX != pg.sThumbRX {
+        if force || g.sThumbRX != pg.sThumbRX {
             Self::send_xinput_axis_event(
                 tx,
+                epoch,
                 id,
                 crate::native_ev_codes::AXIS_RSTICKX.into_u32(),
                 Event::new(
@@ -352,9 +420,10 @@ impl Gilrs {
                 ),
             );
         }
-        if g.sThumbRY != pg.sThumbRY {
+        if force || g.sThumbRY != pg.sThumbRY {
             Self::send_xinput_axis_event(
                 tx,
+                epoch,
                 id,
                 crate::native_ev_codes::AXIS_RSTICKY.into_u32(),
                 Event::new(
@@ -366,10 +435,11 @@ impl Gilrs {
                 ),
             );
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_UP) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_UP) {
             match g.wButtons & XINPUT_GAMEPAD_DPAD_UP != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_UP),
@@ -377,6 +447,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_UP),
@@ -384,10 +455,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_DOWN) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_DOWN) {
             match g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_DOWN),
@@ -395,6 +467,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_DOWN),
@@ -402,10 +475,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_LEFT) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_LEFT) {
             match g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_LEFT),
@@ -413,6 +487,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_LEFT),
@@ -420,10 +495,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_RIGHT) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_RIGHT) {
             match g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_RIGHT),
@@ -431,6 +507,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_RIGHT),
@@ -438,10 +515,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_START) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_START) {
             match g.wButtons & XINPUT_GAMEPAD_START != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_START),
@@ -449,6 +527,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_START),
@@ -456,10 +535,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_BACK) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_BACK) {
             match g.wButtons & XINPUT_GAMEPAD_BACK != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_SELECT),
@@ -467,6 +547,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_SELECT),
@@ -474,10 +555,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_LEFT_THUMB) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_LEFT_THUMB) {
             match g.wButtons & XINPUT_GAMEPAD_LEFT_THUMB != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_LTHUMB),
@@ -485,6 +567,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_LTHUMB),
@@ -492,10 +575,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_RIGHT_THUMB) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_RIGHT_THUMB) {
             match g.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_RTHUMB),
@@ -503,6 +587,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_RTHUMB),
@@ -510,14 +595,16 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_LEFT_SHOULDER) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_LEFT_SHOULDER) {
             match g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(id, EventType::ButtonPressed(crate::native_ev_codes::BTN_LT)),
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_LT),
@@ -525,14 +612,16 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_RIGHT_SHOULDER) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_RIGHT_SHOULDER) {
             match g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(id, EventType::ButtonPressed(crate::native_ev_codes::BTN_RT)),
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_RT),
@@ -540,10 +629,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_A) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_A) {
             match g.wButtons & XINPUT_GAMEPAD_A != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_SOUTH),
@@ -551,6 +641,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_SOUTH),
@@ -558,10 +649,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_B) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_B) {
             match g.wButtons & XINPUT_GAMEPAD_B != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_EAST),
@@ -569,6 +661,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_EAST),
@@ -576,10 +669,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_X) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_X) {
             match g.wButtons & XINPUT_GAMEPAD_X != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_WEST),
@@ -587,6 +681,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_WEST),
@@ -594,10 +689,11 @@ impl Gilrs {
                 ),
             };
         }
-        if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_Y) {
+        if force || !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_Y) {
             match g.wButtons & XINPUT_GAMEPAD_Y != 0 {
                 true => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonPressed(crate::native_ev_codes::BTN_NORTH),
@@ -605,6 +701,7 @@ impl Gilrs {
                 ),
                 false => Self::send_xinput_event(
                     tx,
+                    epoch,
                     Event::new(
                         id,
                         EventType::ButtonReleased(crate::native_ev_codes::BTN_NORTH),

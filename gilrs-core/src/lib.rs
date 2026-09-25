@@ -135,6 +135,11 @@ impl Gilrs {
         self.inner.shutdown()
     }
 
+    /// Purges queued input and asks the platform worker to re-emit its current state.
+    pub fn reset(&mut self) -> Result<(), ResetError> {
+        self.inner.reset()
+    }
+
     /// Borrows `Gamepad` or return `None` if index is invalid. Returned gamepad may be disconnected.
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
         unsafe {
@@ -273,6 +278,30 @@ impl Display for EvCode {
         self.0.fmt(f)
     }
 }
+
+/// Error returned when a platform input worker cannot be reset cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResetError {
+    /// The worker is no longer available to accept reset requests.
+    BackendUnavailable,
+    /// The worker did not acknowledge the reset before the deadline.
+    TimedOut,
+    /// The worker reported a platform-specific reset failure.
+    WorkerFailed,
+}
+
+impl Display for ResetError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ResetError::BackendUnavailable => f.write_str("the input worker is unavailable"),
+            ResetError::TimedOut => f.write_str("the input worker reset timed out"),
+            ResetError::WorkerFailed => f.write_str("the input worker failed to reset"),
+        }
+    }
+}
+
+impl error::Error for ResetError {}
 
 /// Error returned when a platform input worker cannot be stopped cleanly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

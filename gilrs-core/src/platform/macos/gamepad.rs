@@ -10,7 +10,7 @@ use super::FfDevice;
 use crate::event_queue::{
     bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
 };
-use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
+use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ResetError, ShutdownError};
 
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRetained, CFRunLoop, Type};
 use objc2_io_kit::{
@@ -25,7 +25,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::os::raw::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -42,11 +42,17 @@ enum WorkerExit {
 }
 
 #[derive(Debug)]
+enum Control {
+    Stop,
+    Reset(SyncSender<Result<(), ResetError>>),
+}
+
+#[derive(Debug)]
 pub struct Gilrs {
     gamepads: Vec<Gamepad>,
     device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
     rx: EventReceiver<(Event, Option<Device>)>,
-    stop_tx: Option<Sender<()>>,
+    control_tx: Option<SyncSender<Control>>,
     join_handle: Option<JoinHandle<()>>,
     completion: Option<Receiver<WorkerExit>>,
 }
@@ -57,14 +63,14 @@ impl Gilrs {
         let device_infos = Arc::new(Mutex::new(Vec::new()));
 
         let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let (join_handle, completion) = Self::spawn_thread(tx, device_infos.clone(), stop_rx)?;
+        let (control_tx, control_rx) = mpsc::sync_channel(1);
+        let (join_handle, completion) = Self::spawn_thread(tx, device_infos.clone(), control_rx)?;
 
         Ok(Gilrs {
             gamepads,
             device_infos,
             rx,
-            stop_tx: Some(stop_tx),
+            control_tx: Some(control_tx),
             join_handle: Some(join_handle),
             completion: Some(completion),
         })
@@ -73,14 +79,14 @@ impl Gilrs {
     fn spawn_thread(
         tx: EventSender<(Event, Option<Device>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
-        stop_rx: Receiver<()>,
+        control_rx: Receiver<Control>,
     ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
         let (completion_tx, completion) = mpsc::sync_channel(1);
         let join_handle = thread::Builder::new()
             .name("gilrs".to_owned())
             .spawn(move || {
                 let exit = match catch_unwind(AssertUnwindSafe(|| {
-                    Self::run_iohid_thread(tx, device_infos, stop_rx)
+                    Self::run_iohid_thread(tx, device_infos, control_rx)
                 })) {
                     Ok(Ok(())) => WorkerExit::Stopped,
                     Ok(Err(error)) => {
@@ -102,7 +108,7 @@ impl Gilrs {
     fn run_iohid_thread(
         tx: EventSender<(Event, Option<Device>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
-        stop_rx: Receiver<()>,
+        control_rx: Receiver<Control>,
     ) -> Result<(), WorkerExit> {
         let manager = new_manager().ok_or(WorkerExit::Failed)?;
         let rl = CFRunLoop::current().ok_or(WorkerExit::Failed)?;
@@ -126,8 +132,11 @@ impl Gilrs {
         unsafe { manager.register_input_value_callback(Some(input_value_cb), context_ptr) };
 
         loop {
-            match stop_rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => break,
+            match control_rx.try_recv() {
+                Ok(Control::Stop) | Err(TryRecvError::Disconnected) => break,
+                Ok(Control::Reset(ack)) => {
+                    let _ = ack.send(Ok(()));
+                }
                 Err(TryRecvError::Empty) => {}
             }
             CFRunLoop::run_in_mode(None, 0.1, false);
@@ -158,7 +167,12 @@ impl Gilrs {
     fn handle_queue_item(&mut self, item: QueueItem<(Event, Option<Device>)>) -> Option<Event> {
         match item {
             QueueItem::Event(event) => self.handle_event(Some(event)),
-            QueueItem::Overflow { dropped } => Some(Event::new(0, EventType::Overflow { dropped })),
+            QueueItem::Overflow { dropped } => {
+                if let Err(error) = self.reset() {
+                    warn!("macOS recovery after queue overflow failed: {error:?}");
+                }
+                Some(Event::new(0, EventType::Overflow { dropped }))
+            }
         }
     }
 
@@ -215,6 +229,22 @@ impl Gilrs {
     pub fn last_gamepad_hint(&self) -> usize {
         self.gamepads.len()
     }
+    pub(crate) fn reset(&mut self) -> Result<(), ResetError> {
+        self.rx.advance_epoch();
+        let Some(control_tx) = self.control_tx.as_ref() else {
+            return Err(ResetError::BackendUnavailable);
+        };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        control_tx
+            .send(Control::Reset(ack_tx))
+            .map_err(|_| ResetError::BackendUnavailable)?;
+        match ack_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ResetError::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ResetError::WorkerFailed),
+        }
+    }
+
     pub(crate) fn shutdown(&mut self) -> Result<(), ShutdownError> {
         self.stop_and_join().map_err(|error| match error {
             WorkerExit::Stopped | WorkerExit::Failed => ShutdownError::WorkerFailed,
@@ -230,9 +260,9 @@ impl Gilrs {
         };
 
         let stop_result = self
-            .stop_tx
+            .control_tx
             .take()
-            .map(|stop_tx| stop_tx.send(()))
+            .map(|control_tx| control_tx.send(Control::Stop))
             .unwrap_or(Ok(()));
         let completion = self
             .completion
@@ -772,13 +802,14 @@ fn context_event_key(event: &Event) -> Option<u64> {
 
 fn send_context_event(
     tx: &EventSender<(Event, Option<Device>)>,
+    epoch: u64,
     event: Event,
     device: Option<Device>,
     latest: bool,
 ) {
     let result = match (latest, context_event_key(&event)) {
-        (true, Some(key)) => tx.push_latest(key, (event, device)),
-        _ => tx.push((event, device)),
+        (true, Some(key)) => tx.push_latest_with_epoch(epoch, key, (event, device)),
+        _ => tx.push_with_epoch(epoch, (event, device)),
     };
     if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
         warn!("macOS IOHID event queue rejected an event: {result:?}");
@@ -796,6 +827,7 @@ extern "C-unwind" fn device_matching_cb(
     // SAFETY: The context is the one we passed in `Gilrs::spawn_thread`.
     let context = unsafe { &*(context as *const Context) };
     let tx = &context.tx;
+    let epoch = tx.epoch();
     let device_infos = &context.device_infos;
 
     let io_service = match IOService::new(device.service()) {
@@ -857,6 +889,7 @@ extern "C-unwind" fn device_matching_cb(
     };
     send_context_event(
         tx,
+        epoch,
         Event::new(id, EventType::Connected),
         Some(Device(device.retain())),
         false,
@@ -875,6 +908,7 @@ unsafe extern "C-unwind" fn device_removal_cb(
     // SAFETY: The context is the one we passed in `Gilrs::spawn_thread`.
     let context = unsafe { &*(context as *const Context) };
     let tx = &context.tx;
+    let epoch = tx.epoch();
     let device_infos = &context.device_infos;
 
     let location_id = match device.get_location_id() {
@@ -897,7 +931,13 @@ unsafe extern "C-unwind" fn device_removal_cb(
         }
     };
 
-    send_context_event(tx, Event::new(id, EventType::Disconnected), None, false);
+    send_context_event(
+        tx,
+        epoch,
+        Event::new(id, EventType::Disconnected),
+        None,
+        false,
+    );
 }
 
 #[allow(clippy::type_complexity)]
@@ -912,6 +952,7 @@ unsafe extern "C-unwind" fn input_value_cb(
     // SAFETY: The context is the one we passed in `Gilrs::spawn_thread`.
     let context = unsafe { &*(context as *const Context) };
     let tx = &context.tx;
+    let epoch = tx.epoch();
     let device_infos = &context.device_infos;
 
     // SAFETY: TODO.
@@ -965,20 +1006,20 @@ unsafe extern "C-unwind" fn input_value_cb(
                 crate::EvCode(EvCode { page, usage }),
             ),
         );
-        send_context_event(tx, event, None, true);
+        send_context_event(tx, epoch, event, None, true);
     } else if element_is_button(type_, page, usage) {
         if value.integer_value() == 0 {
             let event = Event::new(
                 id,
                 EventType::ButtonReleased(crate::EvCode(EvCode { page, usage })),
             );
-            send_context_event(tx, event, None, false);
+            send_context_event(tx, epoch, event, None, false);
         } else {
             let event = Event::new(
                 id,
                 EventType::ButtonPressed(crate::EvCode(EvCode { page, usage })),
             );
-            send_context_event(tx, event, None, false);
+            send_context_event(tx, epoch, event, None, false);
         }
     } else if element_is_hat(type_, page, usage) {
         // Hat switch values are reported with a range of usually 8 numbers (sometimes 4). The logic
@@ -1043,7 +1084,7 @@ unsafe extern "C-unwind" fn input_value_cb(
             ),
         );
 
-        send_context_event(tx, x_axis_event, None, true);
-        send_context_event(tx, y_axis_event, None, true);
+        send_context_event(tx, epoch, x_axis_event, None, true);
+        send_context_event(tx, epoch, y_axis_event, None, true);
     }
 }

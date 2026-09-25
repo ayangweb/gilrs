@@ -10,6 +10,7 @@ pub(crate) enum EnqueueResult {
     Enqueued,
     Coalesced,
     Overflowed,
+    Stale,
     Closed,
 }
 
@@ -21,6 +22,7 @@ pub(crate) enum QueueItem<T> {
 
 struct Entry<T> {
     key: Option<u64>,
+    epoch: u64,
     value: T,
 }
 
@@ -32,6 +34,7 @@ struct State<T> {
     overflow_pending: bool,
     pending_dropped: u64,
     total_dropped: u64,
+    current_epoch: u64,
 }
 
 struct Inner<T> {
@@ -60,6 +63,7 @@ pub(crate) fn bounded<T>(capacity: usize) -> (EventSender<T>, EventReceiver<T>) 
             overflow_pending: false,
             pending_dropped: 0,
             total_dropped: 0,
+            current_epoch: 0,
         }),
         ready: Condvar::new(),
         capacity,
@@ -81,18 +85,25 @@ impl<T> EventSender<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub(crate) fn push(&self, value: T) -> EnqueueResult {
-        self.push_key(None, value)
+    pub(crate) fn epoch(&self) -> u64 {
+        self.lock_state().current_epoch
     }
 
-    pub(crate) fn push_latest(&self, key: u64, value: T) -> EnqueueResult {
-        self.push_key(Some(key), value)
+    pub(crate) fn push_with_epoch(&self, epoch: u64, value: T) -> EnqueueResult {
+        self.push_key(epoch, None, value)
     }
 
-    fn push_key(&self, key: Option<u64>, value: T) -> EnqueueResult {
+    pub(crate) fn push_latest_with_epoch(&self, epoch: u64, key: u64, value: T) -> EnqueueResult {
+        self.push_key(epoch, Some(key), value)
+    }
+
+    fn push_key(&self, epoch: u64, key: Option<u64>, value: T) -> EnqueueResult {
         let mut state = self.lock_state();
         if state.closed || !state.receiver_alive {
             return EnqueueResult::Closed;
+        }
+        if epoch != state.current_epoch {
+            return EnqueueResult::Stale;
         }
 
         if state.overflow_pending {
@@ -105,7 +116,7 @@ impl<T> EventSender<T> {
             if let Some(entry) = state
                 .entries
                 .iter_mut()
-                .find(|entry| entry.key == Some(key))
+                .find(|entry| entry.epoch == epoch && entry.key == Some(key))
             {
                 entry.value = value;
                 return EnqueueResult::Coalesced;
@@ -122,7 +133,7 @@ impl<T> EventSender<T> {
             return EnqueueResult::Overflowed;
         }
 
-        state.entries.push_back(Entry { key, value });
+        state.entries.push_back(Entry { key, epoch, value });
         self.inner.ready.notify_one();
         EnqueueResult::Enqueued
     }
@@ -203,6 +214,16 @@ impl<T> EventReceiver<T> {
         }
     }
 
+    pub(crate) fn advance_epoch(&self) -> u64 {
+        let mut state = self.lock_state();
+        state.current_epoch = state.current_epoch.saturating_add(1);
+        state.entries.clear();
+        state.overflow_pending = false;
+        state.pending_dropped = 0;
+        self.inner.ready.notify_all();
+        state.current_epoch
+    }
+
     pub(crate) fn dropped_count(&self) -> u64 {
         self.lock_state().total_dropped
     }
@@ -227,10 +248,13 @@ fn pop_locked<T>(state: &mut State<T>) -> Option<QueueItem<T>> {
         return Some(QueueItem::Overflow { dropped });
     }
 
-    state
-        .entries
-        .pop_front()
-        .map(|entry| QueueItem::Event(entry.value))
+    while let Some(entry) = state.entries.pop_front() {
+        if entry.epoch == state.current_epoch {
+            return Some(QueueItem::Event(entry.value));
+        }
+    }
+
+    None
 }
 
 impl<T> fmt::Debug for EventSender<T> {
@@ -254,10 +278,22 @@ mod tests {
     #[test]
     fn overflow_discards_stale_entries_and_reports_the_count() {
         let (sender, receiver) = bounded(2);
-        assert_eq!(sender.push(1), EnqueueResult::Enqueued);
-        assert_eq!(sender.push(2), EnqueueResult::Enqueued);
-        assert_eq!(sender.push(3), EnqueueResult::Overflowed);
-        assert_eq!(sender.push(4), EnqueueResult::Overflowed);
+        assert_eq!(
+            sender.push_with_epoch(sender.epoch(), 1),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            sender.push_with_epoch(sender.epoch(), 2),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            sender.push_with_epoch(sender.epoch(), 3),
+            EnqueueResult::Overflowed
+        );
+        assert_eq!(
+            sender.push_with_epoch(sender.epoch(), 4),
+            EnqueueResult::Overflowed
+        );
 
         assert!(matches!(
             receiver.try_pop(),
@@ -270,9 +306,18 @@ mod tests {
     #[test]
     fn latest_values_coalesce_without_changing_queue_order() {
         let (sender, receiver) = bounded(2);
-        assert_eq!(sender.push("edge"), EnqueueResult::Enqueued);
-        assert_eq!(sender.push_latest(7, "axis-old"), EnqueueResult::Enqueued);
-        assert_eq!(sender.push_latest(7, "axis-new"), EnqueueResult::Coalesced);
+        assert_eq!(
+            sender.push_with_epoch(sender.epoch(), "edge"),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            sender.push_latest_with_epoch(sender.epoch(), 7, "axis-old"),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            sender.push_latest_with_epoch(sender.epoch(), 7, "axis-new"),
+            EnqueueResult::Coalesced
+        );
 
         assert!(matches!(receiver.try_pop(), Some(QueueItem::Event("edge"))));
         assert!(matches!(
@@ -280,6 +325,28 @@ mod tests {
             Some(QueueItem::Event("axis-new"))
         ));
         assert!(receiver.try_pop().is_none());
+    }
+
+    #[test]
+    fn advancing_epoch_purges_old_events_and_rejects_late_producers() {
+        let (sender, receiver) = bounded(2);
+        let old_epoch = sender.epoch();
+        assert_eq!(
+            sender.push_with_epoch(old_epoch, "old"),
+            EnqueueResult::Enqueued
+        );
+        let new_epoch = receiver.advance_epoch();
+        assert_ne!(old_epoch, new_epoch);
+        assert_eq!(
+            sender.push_with_epoch(old_epoch, "late"),
+            EnqueueResult::Stale
+        );
+        assert!(receiver.try_pop().is_none());
+        assert_eq!(
+            sender.push_with_epoch(new_epoch, "new"),
+            EnqueueResult::Enqueued
+        );
+        assert!(matches!(receiver.try_pop(), Some(QueueItem::Event("new"))));
     }
 
     #[test]
@@ -292,7 +359,7 @@ mod tests {
         });
 
         ready_rx.recv().unwrap();
-        sender.push(11);
+        sender.push_with_epoch(sender.epoch(), 11);
         assert!(matches!(worker.join().unwrap(), Some(QueueItem::Event(11))));
     }
 

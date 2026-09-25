@@ -10,7 +10,9 @@ use crate::event_queue::{
     bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
 };
 use crate::native_ev_codes as nec;
-use crate::{utils, AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
+use crate::{
+    utils, AxisInfo, Event, EventType, PlatformError, PowerInfo, ResetError, ShutdownError,
+};
 
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -47,6 +49,12 @@ enum WorkerExit {
     Panicked,
     TimedOut,
     StopSignalFailed,
+}
+
+#[derive(Debug)]
+enum Control {
+    Stop,
+    Reset(SyncSender<Result<(), ResetError>>),
 }
 
 const WGI_TO_GILRS_BUTTON_MAP: [(GamepadButtons, crate::EvCode); 14] = [
@@ -97,8 +105,8 @@ struct WorkerEventHandler {
 // alive until it is removed.
 unsafe impl Send for WorkerEventHandler {}
 
-fn send_wgi_event(tx: &EventSender<WgiEvent>, event: WgiEvent) {
-    let result = tx.push(event);
+fn send_wgi_event(tx: &EventSender<WgiEvent>, epoch: u64, event: WgiEvent) {
+    let result = tx.push_with_epoch(epoch, event);
     if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
         warn!("WGI event queue rejected an event: {result:?}");
     }
@@ -114,13 +122,14 @@ fn controller_axis_key(controller: &RawGameController, code: u32) -> Option<u64>
 
 fn send_wgi_axis_event(
     tx: &EventSender<WgiEvent>,
+    epoch: u64,
     controller: &RawGameController,
     code: u32,
     event: WgiEvent,
 ) {
     let result = match controller_axis_key(controller, code) {
-        Some(key) => tx.push_latest(key, event),
-        None => tx.push(event),
+        Some(key) => tx.push_latest_with_epoch(epoch, key, event),
+        None => tx.push_with_epoch(epoch, event),
     };
     if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
         warn!("WGI axis queue rejected an event: {result:?}");
@@ -132,7 +141,7 @@ pub struct Gilrs {
     gamepads: Vec<Gamepad>,
     rx: EventReceiver<WgiEvent>,
     join_handle: Option<JoinHandle<()>>,
-    stop_tx: Option<Sender<()>>,
+    control_tx: Option<SyncSender<Control>>,
     completion: Option<Receiver<WorkerExit>>,
 }
 
@@ -156,25 +165,30 @@ impl Gilrs {
             .collect::<Result<Vec<_>, _>>()?;
 
         let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let (join_handle, completion) = Self::spawn_thread(tx, stop_rx)?;
+        let (control_tx, control_rx) = mpsc::sync_channel(1);
+        let (join_handle, completion) = Self::spawn_thread(tx, control_rx)?;
         Ok(Gilrs {
             gamepads,
             rx,
             join_handle: Some(join_handle),
-            stop_tx: Some(stop_tx),
+            control_tx: Some(control_tx),
             completion: Some(completion),
         })
     }
 
     fn spawn_thread(
         tx: EventSender<WgiEvent>,
-        stop_rx: Receiver<()>,
+        control_rx: Receiver<Control>,
     ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
         let added_tx = tx.clone();
         let added_handler = EventHandler::<RawGameController>::new(move |_, g| {
             if let Some(g) = g.as_ref() {
-                send_wgi_event(&added_tx, WgiEvent::new(g.clone(), EventType::Connected));
+                let epoch = added_tx.epoch();
+                send_wgi_event(
+                    &added_tx,
+                    epoch,
+                    WgiEvent::new(g.clone(), EventType::Connected),
+                );
             }
             Ok(())
         });
@@ -184,8 +198,10 @@ impl Gilrs {
         let removed_tx = tx.clone();
         let removed_handler = EventHandler::<RawGameController>::new(move |_, g| {
             if let Some(g) = g.as_ref() {
+                let epoch = removed_tx.epoch();
                 send_wgi_event(
                     &removed_tx,
+                    epoch,
                     WgiEvent::new(g.clone(), EventType::Disconnected),
                 );
             }
@@ -222,7 +238,8 @@ impl Gilrs {
                     let _added_handler = added_handler;
                     let _removed_handler = removed_handler;
 
-                    let result = catch_unwind(AssertUnwindSafe(|| Self::run_worker(tx, stop_rx)));
+                    let result =
+                        catch_unwind(AssertUnwindSafe(|| Self::run_worker(tx, control_rx)));
                     let exit = match result {
                         Ok(()) => WorkerExit::Stopped,
                         Err(_) => {
@@ -270,21 +287,22 @@ impl Gilrs {
         Ok((join_handle, completion))
     }
 
-    fn run_worker(tx: EventSender<WgiEvent>, stop_rx: Receiver<()>) {
+    fn run_worker(tx: EventSender<WgiEvent>, control_rx: Receiver<Control>) {
         let mut controllers: Vec<RawGameController> = Vec::new();
         // To avoid allocating every update, store old and new readings for every controller
         // and swap their memory
         let mut readings: Vec<(HSTRING, Reading, Reading)> = Vec::new();
         let mut last_failed_get_id: Option<Instant> = None;
         loop {
-            match stop_rx.try_recv() {
-                Ok(_) => break,
-                Err(TryRecvError::Disconnected) => {
-                    warn!("stop_rx channel disconnected prematurely");
-                    break;
+            match control_rx.try_recv() {
+                Ok(Control::Stop) | Err(TryRecvError::Disconnected) => break,
+                Ok(Control::Reset(ack)) => {
+                    readings.clear();
+                    let _ = ack.send(Ok(()));
                 }
                 Err(TryRecvError::Empty) => {}
             }
+            let epoch = tx.epoch();
             controllers.clear();
             // Avoiding using RawGameControllers().into_iter() here due to it causing an
             // unhandled exception when the app is running through steam.
@@ -330,6 +348,10 @@ impl Gilrs {
                             }
                         };
 
+                        let zero = reading.zero_like();
+                        Reading::send_events_for_differences(
+                            &zero, &reading, controller, &tx, epoch, true,
+                        );
                         readings.push((id, reading.clone(), reading));
                         readings.len() - 1
                     }
@@ -352,7 +374,14 @@ impl Gilrs {
                     continue;
                 }
 
-                Reading::send_events_for_differences(old_reading, new_reading, controller, &tx);
+                Reading::send_events_for_differences(
+                    old_reading,
+                    new_reading,
+                    controller,
+                    &tx,
+                    epoch,
+                    false,
+                );
             }
             thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
         }
@@ -373,7 +402,28 @@ impl Gilrs {
     fn handle_queue_item(&mut self, item: QueueItem<WgiEvent>) -> Option<Event> {
         match item {
             QueueItem::Event(wgi_event) => self.handle_event(wgi_event),
-            QueueItem::Overflow { dropped } => Some(Event::new(0, EventType::Overflow { dropped })),
+            QueueItem::Overflow { dropped } => {
+                if let Err(error) = self.reset() {
+                    warn!("WGI recovery after queue overflow failed: {error:?}");
+                }
+                Some(Event::new(0, EventType::Overflow { dropped }))
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<(), ResetError> {
+        self.rx.advance_epoch();
+        let Some(control_tx) = self.control_tx.as_ref() else {
+            return Err(ResetError::BackendUnavailable);
+        };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        control_tx
+            .send(Control::Reset(ack_tx))
+            .map_err(|_| ResetError::BackendUnavailable)?;
+        match ack_rx.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ResetError::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ResetError::WorkerFailed),
         }
     }
 
@@ -434,9 +484,9 @@ impl Gilrs {
         };
 
         let stop_result = self
-            .stop_tx
+            .control_tx
             .take()
-            .map(|stop_tx| stop_tx.send(()))
+            .map(|control_tx| control_tx.send(Control::Stop))
             .unwrap_or(Ok(()));
         let completion = self
             .completion
@@ -571,18 +621,32 @@ impl Reading {
         Ok(())
     }
 
+    fn zero_like(&self) -> Self {
+        match self {
+            Reading::Raw(raw) => Reading::Raw(RawGamepadReading {
+                axes: vec![0.0; raw.axes.len()],
+                buttons: vec![false; raw.buttons.len()],
+                switches: vec![GameControllerSwitchPosition::default(); raw.switches.len()],
+                time: 0,
+            }),
+            Reading::Gamepad(_) => Reading::Gamepad(GamepadReading::default()),
+        }
+    }
+
     fn send_events_for_differences(
         old: &Self,
         new: &Self,
         controller: &RawGameController,
         tx: &EventSender<WgiEvent>,
+        epoch: u64,
+        force: bool,
     ) {
         match (old, new) {
             // WGI RawGameController
             (Reading::Raw(old), Reading::Raw(new)) => {
                 // Axis changes
                 for index in 0..new.axes.len() {
-                    if old.axes.get(index) != new.axes.get(index) {
+                    if force || old.axes.get(index) != new.axes.get(index) {
                         // https://github.com/libsdl-org/SDL/blob/6af17369ca773155bd7f39b8801725c4a6d52e4f/src/joystick/windows/SDL_windows_gaming_input.c#L863
                         let value = ((new.axes[index] * 65535.0) - 32768.0) as i32;
                         let event_type = EventType::AxisValueChanged(
@@ -594,6 +658,7 @@ impl Reading {
                         );
                         send_wgi_axis_event(
                             tx,
+                            epoch,
                             controller,
                             index as u32,
                             WgiEvent::new(controller.clone(), event_type),
@@ -601,7 +666,7 @@ impl Reading {
                     }
                 }
                 for index in 0..new.buttons.len() {
-                    if old.buttons.get(index) != new.buttons.get(index) {
+                    if force || old.buttons.get(index) != new.buttons.get(index) {
                         let event_type = match new.buttons[index] {
                             true => EventType::ButtonPressed(crate::EvCode(EvCode {
                                 kind: EvCodeKind::Button,
@@ -612,14 +677,14 @@ impl Reading {
                                 index: index as u32,
                             })),
                         };
-                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
+                        send_wgi_event(tx, epoch, WgiEvent::new(controller.clone(), event_type))
                     }
                 }
 
                 for index in 0..old.switches.len() {
                     let (old_x, old_y) = direction_from_switch(old.switches[index]);
                     let (new_x, new_y) = direction_from_switch(new.switches[index]);
-                    if old_x != new_x {
+                    if force || old_x != new_x {
                         let event_type = EventType::AxisValueChanged(
                             new_x,
                             crate::EvCode(EvCode {
@@ -629,12 +694,13 @@ impl Reading {
                         );
                         send_wgi_axis_event(
                             tx,
+                            epoch,
                             controller,
                             (index * 2) as u32,
                             WgiEvent::new(controller.clone(), event_type),
                         )
                     }
-                    if old_y != new_y {
+                    if force || old_y != new_y {
                         let event_type = EventType::AxisValueChanged(
                             -new_y,
                             crate::EvCode(EvCode {
@@ -644,6 +710,7 @@ impl Reading {
                         );
                         send_wgi_axis_event(
                             tx,
+                            epoch,
                             controller,
                             (index * 2) as u32 + 1,
                             WgiEvent::new(controller.clone(), event_type),
@@ -663,9 +730,10 @@ impl Reading {
                     (new.RightThumbstickY, old.RightThumbstickY, nec::AXIS_RSTICKY, -1.0),
                 ];
                 for (new, old, code, multiplier) in axes {
-                    if new != old {
+                    if force || new != old {
                         send_wgi_axis_event(
                             tx,
+                            epoch,
                             controller,
                             code.into_u32(),
                             WgiEvent::new(
@@ -680,10 +748,11 @@ impl Reading {
                 }
 
                 for (current_button, ev_code) in WGI_TO_GILRS_BUTTON_MAP {
-                    if (new.Buttons & current_button) != (old.Buttons & current_button) {
+                    if force || (new.Buttons & current_button) != (old.Buttons & current_button) {
                         match new.Buttons & current_button != GamepadButtons::None {
                             true => send_wgi_event(
                                 tx,
+                                epoch,
                                 WgiEvent::new(
                                     controller.clone(),
                                     EventType::ButtonPressed(ev_code),
@@ -691,6 +760,7 @@ impl Reading {
                             ),
                             false => send_wgi_event(
                                 tx,
+                                epoch,
                                 WgiEvent::new(
                                     controller.clone(),
                                     EventType::ButtonReleased(ev_code),
