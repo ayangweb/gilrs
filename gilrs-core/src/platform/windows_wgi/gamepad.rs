@@ -12,6 +12,7 @@ use crate::{utils, AxisInfo, Event, EventType, PlatformError, PowerInfo};
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::thread::JoinHandle;
@@ -33,6 +34,15 @@ const SDL_HARDWARE_BUS_USB: u32 = 0x03;
 // means 8 ms between updates.
 // Seems like a good target for how often we update the background thread.
 const EVENT_THREAD_SLEEP_TIME: u64 = 8;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExit {
+    Stopped,
+    Panicked,
+    TimedOut,
+    StopSignalFailed,
+}
 
 const WGI_TO_GILRS_BUTTON_MAP: [(GamepadButtons, crate::EvCode); 14] = [
     (GamepadButtons::DPadUp, nec::BTN_DPAD_UP),
@@ -71,12 +81,30 @@ impl WgiEvent {
     }
 }
 
+struct WorkerEventHandler {
+    #[allow(dead_code)]
+    inner: EventHandler<RawGameController>,
+}
+
+// SAFETY: `EventHandler<T>` exposes `IAgileObject` for its COM vtable and its
+// callback closure is required to be `Send`. The handler is therefore safe to
+// release from the worker thread; the registration token keeps the callback
+// alive until it is removed.
+unsafe impl Send for WorkerEventHandler {}
+
+fn send_wgi_event(tx: &Sender<WgiEvent>, event: WgiEvent) {
+    if let Err(error) = tx.send(event) {
+        warn!("Failed to send WGI event: {error}");
+    }
+}
+
 #[derive(Debug)]
 pub struct Gilrs {
     gamepads: Vec<Gamepad>,
     rx: Receiver<WgiEvent>,
     join_handle: Option<JoinHandle<()>>,
-    stop_tx: Sender<()>,
+    stop_tx: Option<Sender<()>>,
+    completion: Option<Receiver<WorkerExit>>,
 }
 
 impl Gilrs {
@@ -100,140 +128,205 @@ impl Gilrs {
 
         let (tx, rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
-        let join_handle = Some(Self::spawn_thread(tx, stop_rx));
+        let (join_handle, completion) = Self::spawn_thread(tx, stop_rx)?;
         Ok(Gilrs {
             gamepads,
             rx,
-            join_handle,
-            stop_tx,
+            join_handle: Some(join_handle),
+            stop_tx: Some(stop_tx),
+            completion: Some(completion),
         })
     }
 
-    fn spawn_thread(tx: Sender<WgiEvent>, stop_rx: Receiver<()>) -> JoinHandle<()> {
+    fn spawn_thread(
+        tx: Sender<WgiEvent>,
+        stop_rx: Receiver<()>,
+    ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
         let added_tx = tx.clone();
         let added_handler = EventHandler::<RawGameController>::new(move |_, g| {
             if let Some(g) = g.as_ref() {
-                added_tx
-                    .send(WgiEvent::new(g.clone(), EventType::Connected))
-                    .expect("should be able to send to main thread");
+                send_wgi_event(&added_tx, WgiEvent::new(g.clone(), EventType::Connected));
             }
             Ok(())
         });
-        let controller_added_token =
-            RawGameController::RawGameControllerAdded(&added_handler).unwrap();
+        let controller_added_token = RawGameController::RawGameControllerAdded(&added_handler)
+            .map_err(|e| PlatformError::Other(Box::new(e)))?;
 
         let removed_tx = tx.clone();
         let removed_handler = EventHandler::<RawGameController>::new(move |_, g| {
             if let Some(g) = g.as_ref() {
-                removed_tx
-                    .send(WgiEvent::new(g.clone(), EventType::Disconnected))
-                    .expect("should be able to send to main thread");
+                send_wgi_event(
+                    &removed_tx,
+                    WgiEvent::new(g.clone(), EventType::Disconnected),
+                );
             }
             Ok(())
         });
         let controller_removed_token =
-            RawGameController::RawGameControllerRemoved(&removed_handler).unwrap();
-
-        std::thread::Builder::new()
-            .name("gilrs".to_owned())
-            .spawn(move || {
-                let mut controllers: Vec<RawGameController> = Vec::new();
-                // To avoid allocating every update, store old and new readings for every controller
-                // and swap their memory
-                let mut readings: Vec<(HSTRING, Reading, Reading)> = Vec::new();
-                let mut last_failed_get_id: Option<Instant> = None;
-                loop {
-                    match stop_rx.try_recv() {
-                        Ok(_) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            warn!("stop_rx channel disconnected prematurely");
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => {}
+            match RawGameController::RawGameControllerRemoved(&removed_handler) {
+                Ok(token) => token,
+                Err(error) => {
+                    if let Err(remove_error) =
+                        RawGameController::RemoveRawGameControllerAdded(controller_added_token)
+                    {
+                        error!(
+                            "Failed to remove RawGameControllerAdded event handler after \
+                             registration failure: {remove_error}"
+                        );
                     }
-                    controllers.clear();
-                    // Avoiding using RawGameControllers().into_iter() here due to it causing an
-                    // unhandled exception when the app is running through steam.
-                    // https://gitlab.com/gilrs-project/gilrs/-/issues/132
-                    if let Ok(raw_game_controllers) = RawGameController::RawGameControllers() {
-                        let count = raw_game_controllers.Size().unwrap_or_default();
-                        for index in 0..count {
-                            if let Ok(controller) = raw_game_controllers.GetAt(index) {
-                                controllers.push(controller);
+                    return Err(PlatformError::Other(Box::new(error)));
+                }
+            };
+
+        let (completion_tx, completion) = mpsc::sync_channel(1);
+        let added_handler = WorkerEventHandler {
+            inner: added_handler,
+        };
+        let removed_handler = WorkerEventHandler {
+            inner: removed_handler,
+        };
+        let join_handle =
+            match std::thread::Builder::new()
+                .name("gilrs".to_owned())
+                .spawn(move || {
+                    // Keep both handlers alive until the matching WinRT registrations are removed.
+                    let _added_handler = added_handler;
+                    let _removed_handler = removed_handler;
+
+                    let result = catch_unwind(AssertUnwindSafe(|| Self::run_worker(tx, stop_rx)));
+                    let exit = match result {
+                        Ok(()) => WorkerExit::Stopped,
+                        Err(_) => {
+                            error!("WGI worker panicked");
+                            WorkerExit::Panicked
+                        }
+                    };
+
+                    if let Err(error) =
+                        RawGameController::RemoveRawGameControllerAdded(controller_added_token)
+                    {
+                        error!("Failed to remove RawGameControllerAdded event handler: {error}");
+                    }
+
+                    if let Err(error) =
+                        RawGameController::RemoveRawGameControllerRemoved(controller_removed_token)
+                    {
+                        error!("Failed to remove RawGameControllerRemoved event handler: {error}");
+                    }
+
+                    let _ = completion_tx.send(exit);
+                }) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    if let Err(remove_error) =
+                        RawGameController::RemoveRawGameControllerAdded(controller_added_token)
+                    {
+                        error!(
+                            "Failed to remove RawGameControllerAdded event handler after spawn \
+                         failure: {remove_error}"
+                        );
+                    }
+                    if let Err(remove_error) =
+                        RawGameController::RemoveRawGameControllerRemoved(controller_removed_token)
+                    {
+                        error!(
+                            "Failed to remove RawGameControllerRemoved event handler after spawn \
+                         failure: {remove_error}"
+                        );
+                    }
+                    return Err(PlatformError::Other(Box::new(error)));
+                }
+            };
+
+        Ok((join_handle, completion))
+    }
+
+    fn run_worker(tx: Sender<WgiEvent>, stop_rx: Receiver<()>) {
+        let mut controllers: Vec<RawGameController> = Vec::new();
+        // To avoid allocating every update, store old and new readings for every controller
+        // and swap their memory
+        let mut readings: Vec<(HSTRING, Reading, Reading)> = Vec::new();
+        let mut last_failed_get_id: Option<Instant> = None;
+        loop {
+            match stop_rx.try_recv() {
+                Ok(_) => break,
+                Err(TryRecvError::Disconnected) => {
+                    warn!("stop_rx channel disconnected prematurely");
+                    break;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+            controllers.clear();
+            // Avoiding using RawGameControllers().into_iter() here due to it causing an
+            // unhandled exception when the app is running through steam.
+            // https://gitlab.com/gilrs-project/gilrs/-/issues/132
+            if let Ok(raw_game_controllers) = RawGameController::RawGameControllers() {
+                let count = raw_game_controllers.Size().unwrap_or_default();
+                for index in 0..count {
+                    if let Ok(controller) = raw_game_controllers.GetAt(index) {
+                        controllers.push(controller);
+                    }
+                }
+            }
+
+            for controller in controllers.iter() {
+                let id: HSTRING = match controller.NonRoamableId() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        if last_failed_get_id.map_or(true, |x| x.elapsed().as_secs() > 59) {
+                            error!(
+                                "Failed to get gamepad id: {e}! Skipping reading events \
+                                 for this gamepad."
+                            );
+                            last_failed_get_id = Some(Instant::now());
+                        }
+
+                        continue;
+                    }
+                };
+                // Find readings for this controller or insert new ones.
+                let index = match readings.iter().position(|(other_id, ..)| id == *other_id) {
+                    None => {
+                        let reading = match WgiGamepad::FromGameController(controller) {
+                            Ok(wgi_gamepad) => {
+                                wgi_gamepad.GetCurrentReading().map(Reading::Gamepad)
                             }
-                        }
-                    }
-
-                    for controller in controllers.iter() {
-                        let id: HSTRING = match controller.NonRoamableId() {
-                            Ok(id) => id,
-                            Err(e) => {
-                                if last_failed_get_id.map_or(true, |x| x.elapsed().as_secs() > 59) {
-                                    error!(
-                                        "Failed to get gamepad id: {e}! Skipping reading events \
-                                         for this gamepad."
-                                    );
-                                    last_failed_get_id = Some(Instant::now());
-                                }
-
+                            Err(_) => RawGamepadReading::new(controller).map(Reading::Raw),
+                        };
+                        let reading = match reading {
+                            Ok(reading) => reading,
+                            Err(error) => {
+                                error!("Failed to read initial WGI controller state: {error}");
                                 continue;
                             }
                         };
-                        // Find readings for this controller or insert new ones.
-                        let index = match readings.iter().position(|(other_id, ..)| id == *other_id)
-                        {
-                            None => {
-                                let reading = match WgiGamepad::FromGameController(controller) {
-                                    Ok(wgi_gamepad) => {
-                                        Reading::Gamepad(wgi_gamepad.GetCurrentReading().unwrap())
-                                    }
-                                    _ => Reading::Raw(RawGamepadReading::new(controller).unwrap()),
-                                };
 
-                                readings.push((id, reading.clone(), reading));
-                                readings.len() - 1
-                            }
-                            Some(i) => i,
-                        };
-
-                        let (_, old_reading, new_reading) = &mut readings[index];
-
-                        // Make last update's reading the old reading and get a new one.
-                        std::mem::swap(old_reading, new_reading);
-                        if let Err(e) = new_reading.update(controller) {
-                            if e.code().is_err() {
-                                error!("Reading::update() function failed with {e}");
-                            }
-                        }
-
-                        // Skip if this is the same reading as the last one.
-                        if old_reading.time() == new_reading.time() {
-                            continue;
-                        }
-
-                        Reading::send_events_for_differences(
-                            old_reading,
-                            new_reading,
-                            controller,
-                            &tx,
-                        );
+                        readings.push((id, reading.clone(), reading));
+                        readings.len() - 1
                     }
-                    thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
+                    Some(i) => i,
+                };
+
+                let (_, old_reading, new_reading) = &mut readings[index];
+
+                // Make last update's reading the old reading and get a new one.
+                std::mem::swap(old_reading, new_reading);
+                if let Err(e) = new_reading.update(controller) {
+                    if e.code().is_err() {
+                        error!("Reading::update() function failed with {e}");
+                    }
+                    continue;
                 }
 
-                if let Err(e) =
-                    RawGameController::RemoveRawGameControllerAdded(controller_added_token)
-                {
-                    error!("Failed to remove RawGameControllerAdded event handler: {e}");
+                // Skip if this is the same reading as the last one.
+                if old_reading.time() == new_reading.time() {
+                    continue;
                 }
 
-                if let Err(e) =
-                    RawGameController::RemoveRawGameControllerRemoved(controller_removed_token)
-                {
-                    error!("Failed to remove RawGameControllerRemoved event handler: {e}");
-                }
-            })
-            .expect("failed to spawn thread")
+                Reading::send_events_for_differences(old_reading, new_reading, controller, &tx);
+            }
+            thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
+        }
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
@@ -298,13 +391,61 @@ impl Gilrs {
     }
 }
 
+impl Gilrs {
+    fn stop_and_join(&mut self) -> Result<(), WorkerExit> {
+        let Some(join_handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+
+        let stop_result = self
+            .stop_tx
+            .take()
+            .map(|stop_tx| stop_tx.send(()))
+            .unwrap_or(Ok(()));
+        let completion = self
+            .completion
+            .take()
+            .map(|completion| completion.recv_timeout(SHUTDOWN_TIMEOUT));
+
+        let result = match completion {
+            Some(Ok(WorkerExit::Stopped)) => Ok(()),
+            Some(Ok(WorkerExit::Panicked)) => Err(WorkerExit::Panicked),
+            Some(Ok(WorkerExit::TimedOut | WorkerExit::StopSignalFailed)) => {
+                Err(WorkerExit::StopSignalFailed)
+            }
+            Some(Err(mpsc::RecvTimeoutError::Timeout)) => Err(WorkerExit::TimedOut),
+            Some(Err(mpsc::RecvTimeoutError::Disconnected)) => Err(WorkerExit::StopSignalFailed),
+            None => Err(WorkerExit::StopSignalFailed),
+        };
+
+        if stop_result.is_err()
+            && !matches!(result, Ok(()))
+            && !matches!(result, Err(WorkerExit::Panicked))
+        {
+            return Err(WorkerExit::StopSignalFailed);
+        }
+
+        if matches!(result, Ok(()) | Err(WorkerExit::Panicked)) {
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while !join_handle.is_finished() {
+                if Instant::now() >= deadline {
+                    return Err(WorkerExit::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            return join_handle.join().map_err(|_| WorkerExit::Panicked);
+        }
+
+        Err(result.err().unwrap_or(WorkerExit::StopSignalFailed))
+    }
+}
+
 impl Drop for Gilrs {
     fn drop(&mut self) {
-        if let Err(e) = self.stop_tx.send(()) {
-            warn!("Failed to send stop signal to thread: {e:?}");
-        }
-        if let Err(e) = self.join_handle.take().unwrap().join() {
-            warn!("Failed to join thread: {e:?}");
+        if self.join_handle.is_some() {
+            if let Err(error) = self.stop_and_join() {
+                warn!("WGI worker shutdown was not clean: {error:?}");
+            }
         }
     }
 }
@@ -411,8 +552,7 @@ impl Reading {
                                 index: index as u32,
                             }),
                         );
-                        tx.send(WgiEvent::new(controller.clone(), event_type))
-                            .unwrap()
+                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
                     }
                 }
                 for index in 0..new.buttons.len() {
@@ -427,8 +567,7 @@ impl Reading {
                                 index: index as u32,
                             })),
                         };
-                        tx.send(WgiEvent::new(controller.clone(), event_type))
-                            .unwrap()
+                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
                     }
                 }
 
@@ -443,8 +582,7 @@ impl Reading {
                                 index: (index * 2) as u32,
                             }),
                         );
-                        tx.send(WgiEvent::new(controller.clone(), event_type))
-                            .unwrap()
+                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
                     }
                     if old_y != new_y {
                         let event_type = EventType::AxisValueChanged(
@@ -454,8 +592,7 @@ impl Reading {
                                 index: (index * 2) as u32 + 1,
                             }),
                         );
-                        tx.send(WgiEvent::new(controller.clone(), event_type))
-                            .unwrap()
+                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
                     }
                 }
             }
@@ -472,28 +609,37 @@ impl Reading {
                 ];
                 for (new, old, code, multiplier) in axes {
                     if new != old {
-                        let _ = tx.send(WgiEvent::new(
-                            controller.clone(),
-                            EventType::AxisValueChanged(
-                                (multiplier * new * i32::MAX as f64) as i32,
-                                code,
+                        send_wgi_event(
+                            tx,
+                            WgiEvent::new(
+                                controller.clone(),
+                                EventType::AxisValueChanged(
+                                    (multiplier * new * i32::MAX as f64) as i32,
+                                    code,
+                                ),
                             ),
-                        ));
+                        );
                     }
                 }
 
                 for (current_button, ev_code) in WGI_TO_GILRS_BUTTON_MAP {
                     if (new.Buttons & current_button) != (old.Buttons & current_button) {
-                        let _ = match new.Buttons & current_button != GamepadButtons::None {
-                            true => tx.send(WgiEvent::new(
-                                controller.clone(),
-                                EventType::ButtonPressed(ev_code),
-                            )),
-                            false => tx.send(WgiEvent::new(
-                                controller.clone(),
-                                EventType::ButtonReleased(ev_code),
-                            )),
-                        };
+                        match new.Buttons & current_button != GamepadButtons::None {
+                            true => send_wgi_event(
+                                tx,
+                                WgiEvent::new(
+                                    controller.clone(),
+                                    EventType::ButtonPressed(ev_code),
+                                ),
+                            ),
+                            false => send_wgi_event(
+                                tx,
+                                WgiEvent::new(
+                                    controller.clone(),
+                                    EventType::ButtonReleased(ev_code),
+                                ),
+                            ),
+                        }
                     }
                 }
             }
@@ -599,7 +745,9 @@ impl Gamepad {
         };
 
         if gamepad.wgi_gamepad.is_none() {
-            gamepad.collect_axes_and_buttons();
+            gamepad
+                .collect_axes_and_buttons()
+                .map_err(|e| PlatformError::Other(Box::new(e)))?;
         }
 
         Ok(gamepad)
@@ -720,10 +868,10 @@ impl Gamepad {
         }
     }
 
-    fn collect_axes_and_buttons(&mut self) {
-        let axis_count = self.raw_game_controller.AxisCount().unwrap() as u32;
-        let button_count = self.raw_game_controller.ButtonCount().unwrap() as u32;
-        let switch_count = self.raw_game_controller.SwitchCount().unwrap() as u32;
+    fn collect_axes_and_buttons(&mut self) -> windows::core::Result<()> {
+        let axis_count = self.raw_game_controller.AxisCount()? as u32;
+        let button_count = self.raw_game_controller.ButtonCount()? as u32;
+        let switch_count = self.raw_game_controller.SwitchCount()? as u32;
         self.buttons = Some(
             (0..button_count)
                 .map(|index| EvCode {
@@ -755,6 +903,7 @@ impl Gamepad {
                 )
                 .collect(),
         );
+        Ok(())
     }
 }
 
