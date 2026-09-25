@@ -217,6 +217,10 @@ impl Gilrs {
         self.next_event_impl(timeout)
     }
 
+    pub(crate) fn shutdown(&mut self) -> Result<(), crate::ShutdownError> {
+        Ok(())
+    }
+
     fn next_event_impl(&mut self, timeout: Option<Duration>) -> Option<Event> {
         let mut check_hotplug = false;
 

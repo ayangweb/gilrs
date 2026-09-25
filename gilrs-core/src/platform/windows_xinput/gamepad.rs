@@ -6,15 +6,17 @@
 // copied, modified, or distributed except according to those terms.
 
 use super::FfDevice;
-use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo};
+use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Receiver, Sender, TryRecvError},
     Arc,
 };
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 use rusty_xinput::{
@@ -32,6 +34,15 @@ use winapi::um::xinput::{
 // Chosen by dice roll ;)
 const EVENT_THREAD_SLEEP_TIME: u64 = 10;
 const ITERATIONS_TO_CHECK_IF_CONNECTED: u64 = 100;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExit {
+    Stopped,
+    Panicked,
+    TimedOut,
+    StopSignalFailed,
+}
 
 const MAX_XINPUT_CONTROLLERS: usize = 4;
 
@@ -39,9 +50,13 @@ const MAX_XINPUT_CONTROLLERS: usize = 4;
 pub struct Gilrs {
     gamepads: [Gamepad; MAX_XINPUT_CONTROLLERS],
     rx: Receiver<Event>,
+    stop_tx: Option<Sender<()>>,
+    join_handle: Option<JoinHandle<()>>,
+    completion: Option<Receiver<WorkerExit>>,
 }
 
 impl Gilrs {
+    #[allow(clippy::result_large_err)]
     pub(crate) fn new() -> Result<Self, PlatformError> {
         let xinput_handle = XInputHandle::load_default()
             .map_err(|e| PlatformError::Other(Box::new(Error::FailedToLoadDll(e))))?;
@@ -60,10 +75,18 @@ impl Gilrs {
         }
 
         let (tx, rx) = mpsc::channel();
-        Self::spawn_thread(tx, connected, xinput_handle.clone());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (join_handle, completion) =
+            Self::spawn_thread(tx, connected, xinput_handle.clone(), stop_rx)?;
 
         // Coerce gamepads vector to slice
-        Ok(Gilrs { gamepads, rx })
+        Ok(Gilrs {
+            gamepads,
+            rx,
+            stop_tx: Some(stop_tx),
+            join_handle: Some(join_handle),
+            completion: Some(completion),
+        })
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
@@ -85,6 +108,62 @@ impl Gilrs {
         ev
     }
 
+    pub(crate) fn shutdown(&mut self) -> Result<(), ShutdownError> {
+        self.stop_and_join().map_err(|error| match error {
+            WorkerExit::Stopped => ShutdownError::WorkerFailed,
+            WorkerExit::Panicked => ShutdownError::WorkerPanicked,
+            WorkerExit::TimedOut => ShutdownError::TimedOut,
+            WorkerExit::StopSignalFailed => ShutdownError::StopSignalFailed,
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), WorkerExit> {
+        let Some(join_handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+
+        let stop_result = self
+            .stop_tx
+            .take()
+            .map(|stop_tx| stop_tx.send(()))
+            .unwrap_or(Ok(()));
+        let completion = self
+            .completion
+            .take()
+            .map(|completion| completion.recv_timeout(SHUTDOWN_TIMEOUT));
+
+        let result = match completion {
+            Some(Ok(WorkerExit::Stopped)) => Ok(()),
+            Some(Ok(WorkerExit::Panicked)) => Err(WorkerExit::Panicked),
+            Some(Ok(WorkerExit::TimedOut | WorkerExit::StopSignalFailed)) => {
+                Err(WorkerExit::StopSignalFailed)
+            }
+            Some(Err(mpsc::RecvTimeoutError::Timeout)) => Err(WorkerExit::TimedOut),
+            Some(Err(mpsc::RecvTimeoutError::Disconnected)) => Err(WorkerExit::StopSignalFailed),
+            None => Err(WorkerExit::StopSignalFailed),
+        };
+
+        if stop_result.is_err()
+            && !matches!(result, Ok(()))
+            && !matches!(result, Err(WorkerExit::Panicked))
+        {
+            return Err(WorkerExit::StopSignalFailed);
+        }
+
+        if matches!(result, Ok(()) | Err(WorkerExit::Panicked)) {
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while !join_handle.is_finished() {
+                if Instant::now() >= deadline {
+                    return Err(WorkerExit::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            return join_handle.join().map_err(|_| WorkerExit::Panicked);
+        }
+
+        Err(result.err().unwrap_or(WorkerExit::StopSignalFailed))
+    }
+
     fn handle_evevnt(&mut self, ev: Option<Event>) {
         if let Some(ev) = ev {
             match ev.event {
@@ -103,57 +182,89 @@ impl Gilrs {
         self.gamepads.len()
     }
 
+    #[allow(clippy::result_large_err)]
     fn spawn_thread(
         tx: Sender<Event>,
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
-    ) {
-        std::thread::Builder::new()
+        stop_rx: Receiver<()>,
+    ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
+        let (completion_tx, completion) = mpsc::sync_channel(1);
+        let join_handle = std::thread::Builder::new()
             .name("gilrs".to_owned())
-            .spawn(move || unsafe {
-                // Issue #70 fix - Maintain a prev_state per controller id. Otherwise the loop will compare the prev_state of a different controller.
-                let mut prev_states: [XState; MAX_XINPUT_CONTROLLERS] =
-                    [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
-                let mut connected = connected;
-                let mut counter = 0;
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                    Self::run_worker(tx, connected, xinput_handle, stop_rx)
+                }));
+                let exit = if result.is_ok() {
+                    WorkerExit::Stopped
+                } else {
+                    error!("XInput worker panicked");
+                    WorkerExit::Panicked
+                };
+                let _ = completion_tx.send(exit);
+            })
+            .map_err(|error| PlatformError::Other(Box::new(error)))?;
 
-                loop {
-                    for id in 0..MAX_XINPUT_CONTROLLERS {
-                        if *connected.get_unchecked(id)
-                            || counter % ITERATIONS_TO_CHECK_IF_CONNECTED == 0
-                        {
-                            match xinput_handle.get_state(id as u32) {
-                                Ok(XInputState { raw: state }) => {
-                                    if !connected[id] {
-                                        connected[id] = true;
-                                        let _ = tx.send(Event::new(id, EventType::Connected));
-                                    }
+        Ok((join_handle, completion))
+    }
 
-                                    if state.dwPacketNumber != prev_states[id].dwPacketNumber {
-                                        Self::compare_state(
-                                            id,
-                                            &state.Gamepad,
-                                            &prev_states[id].Gamepad,
-                                            &tx,
-                                        );
-                                        prev_states[id] = state;
-                                    }
-                                }
-                                Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
-                                    connected[id] = false;
-                                    let _ = tx.send(Event::new(id, EventType::Disconnected));
-                                }
-                                Err(XInputUsageError::DeviceNotConnected) => (),
-                                Err(e) => error!("Failed to get gamepad state: {:?}", e),
+    unsafe fn run_worker(
+        tx: Sender<Event>,
+        connected: [bool; MAX_XINPUT_CONTROLLERS],
+        xinput_handle: Arc<XInputHandle>,
+        stop_rx: Receiver<()>,
+    ) {
+        // Issue #70 fix - Maintain a prev_state per controller id. Otherwise the loop will
+        // compare the prev_state of a different controller.
+        let mut prev_states: [XState; MAX_XINPUT_CONTROLLERS] =
+            [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
+        let mut connected = connected;
+        let mut counter = 0;
+
+        loop {
+            match stop_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+            for id in 0..MAX_XINPUT_CONTROLLERS {
+                if *connected.get_unchecked(id) || counter % ITERATIONS_TO_CHECK_IF_CONNECTED == 0 {
+                    match xinput_handle.get_state(id as u32) {
+                        Ok(XInputState { raw: state }) => {
+                            if !connected[id] {
+                                connected[id] = true;
+                                Self::send_xinput_event(&tx, Event::new(id, EventType::Connected));
+                            }
+
+                            if state.dwPacketNumber != prev_states[id].dwPacketNumber {
+                                Self::compare_state(
+                                    id,
+                                    &state.Gamepad,
+                                    &prev_states[id].Gamepad,
+                                    &tx,
+                                );
+                                prev_states[id] = state;
                             }
                         }
+                        Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
+                            connected[id] = false;
+                            Self::send_xinput_event(&tx, Event::new(id, EventType::Disconnected));
+                        }
+                        Err(XInputUsageError::DeviceNotConnected) => (),
+                        Err(e) => error!("Failed to get gamepad state: {:?}", e),
                     }
-
-                    counter = counter.wrapping_add(1);
-                    thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
                 }
-            })
-            .expect("failed to spawn thread");
+            }
+
+            counter = counter.wrapping_add(1);
+            thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
+        }
+    }
+
+    fn send_xinput_event(tx: &Sender<Event>, event: Event) {
+        if let Err(error) = tx.send(event) {
+            warn!("Failed to send XInput event: {error}");
+        }
     }
 
     fn compare_state(id: usize, g: &XGamepad, pg: &XGamepad, tx: &Sender<Event>) {
@@ -378,6 +489,16 @@ impl Gilrs {
                     EventType::ButtonReleased(crate::native_ev_codes::BTN_NORTH),
                 )),
             };
+        }
+    }
+}
+
+impl Drop for Gilrs {
+    fn drop(&mut self) {
+        if self.join_handle.is_some() {
+            if let Err(error) = self.stop_and_join() {
+                warn!("XInput worker shutdown was not clean: {error:?}");
+            }
         }
     }
 }

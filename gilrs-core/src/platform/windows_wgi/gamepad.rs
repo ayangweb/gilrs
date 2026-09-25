@@ -7,7 +7,7 @@
 
 use super::FfDevice;
 use crate::native_ev_codes as nec;
-use crate::{utils, AxisInfo, Event, EventType, PlatformError, PowerInfo};
+use crate::{utils, AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
 
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
@@ -348,6 +348,15 @@ impl Gilrs {
                 .ok()
                 .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
         }
+    }
+
+    pub(crate) fn shutdown(&mut self) -> Result<(), ShutdownError> {
+        self.stop_and_join().map_err(|error| match error {
+            WorkerExit::Stopped => ShutdownError::WorkerFailed,
+            WorkerExit::Panicked => ShutdownError::WorkerPanicked,
+            WorkerExit::TimedOut => ShutdownError::TimedOut,
+            WorkerExit::StopSignalFailed => ShutdownError::StopSignalFailed,
+        })
     }
 
     fn handle_event(&mut self, wgi_event: WgiEvent) -> Option<Event> {

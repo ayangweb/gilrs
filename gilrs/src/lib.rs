@@ -140,6 +140,7 @@ pub use crate::gamepad::{
     ConnectedGamepadsIterator, Error, Gamepad, GamepadId, Gilrs, GilrsBuilder, MappingSource,
     PowerInfo,
 };
+pub use gilrs_core::ShutdownError;
 
 #[cfg(target_os = "linux")]
 pub use crate::gamepad::LinuxGamepadExt;

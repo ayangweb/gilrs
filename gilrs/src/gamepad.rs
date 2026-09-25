@@ -20,6 +20,7 @@ use crate::{
 
 use gilrs_core::{
     self, AxisInfo, Error as PlatformError, Event as RawEvent, EventType as RawEventType,
+    ShutdownError,
 };
 
 use uuid::Uuid;
@@ -169,6 +170,15 @@ impl Gilrs {
     /// This function is not supported on web and will always panic.
     pub fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
         self.next_event_inner(true, timeout)
+    }
+
+    /// Stops the platform input worker and waits for a bounded cleanup acknowledgement.
+    ///
+    /// Call this when the owner is shutting down instead of relying only on
+    /// `Drop`; the result distinguishes a completed cleanup from a timeout,
+    /// worker panic, or platform cleanup failure.
+    pub fn shutdown(mut self) -> Result<(), ShutdownError> {
+        self.inner.shutdown()
     }
 
     fn next_event_inner(

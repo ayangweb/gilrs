@@ -29,6 +29,10 @@ impl Gilrs {
         None
     }
 
+    pub(crate) fn shutdown(&mut self) -> Result<(), crate::ShutdownError> {
+        Ok(())
+    }
+
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
         None
     }

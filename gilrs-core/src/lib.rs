@@ -104,6 +104,7 @@ pub struct Gilrs {
 }
 
 impl Gilrs {
+    #[allow(clippy::result_large_err)]
     pub fn new() -> Result<Self, Error> {
         let inner = platform::Gilrs::new().map_err(|e| match e {
             PlatformError::NotImplemented(inner) => Error::NotImplemented(Gilrs { inner }),
@@ -121,6 +122,11 @@ impl Gilrs {
     /// Returns oldest event, waiting for new event if necessary.
     pub fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
         self.inner.next_event_blocking(timeout)
+    }
+
+    /// Stops the platform input worker and waits for a bounded cleanup acknowledgement.
+    pub fn shutdown(&mut self) -> Result<(), ShutdownError> {
+        self.inner.shutdown()
     }
 
     /// Borrows `Gamepad` or return `None` if index is invalid. Returned gamepad may be disconnected.
@@ -261,6 +267,33 @@ impl Display for EvCode {
         self.0.fmt(f)
     }
 }
+
+/// Error returned when a platform input worker cannot be stopped cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShutdownError {
+    /// The stop signal could not be delivered to the worker.
+    StopSignalFailed,
+    /// The worker stopped because its thread panicked.
+    WorkerPanicked,
+    /// The worker reported a platform cleanup failure.
+    WorkerFailed,
+    /// The worker did not acknowledge shutdown before the deadline.
+    TimedOut,
+}
+
+impl Display for ShutdownError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ShutdownError::StopSignalFailed => f.write_str("failed to signal the input worker"),
+            ShutdownError::WorkerPanicked => f.write_str("the input worker panicked"),
+            ShutdownError::WorkerFailed => f.write_str("the input worker failed to clean up"),
+            ShutdownError::TimedOut => f.write_str("the input worker shutdown timed out"),
+        }
+    }
+}
+
+impl error::Error for ShutdownError {}
 
 /// Error type which can be returned when creating `Gilrs`.
 ///

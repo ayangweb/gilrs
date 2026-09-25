@@ -183,6 +183,10 @@ impl Gilrs {
         unimplemented!("next_event_blocking is not supported on web. Use next_event.")
     }
 
+    pub(crate) fn shutdown(&mut self) -> Result<(), crate::ShutdownError> {
+        Ok(())
+    }
+
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
         self.gamepads.get(id)
     }

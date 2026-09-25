@@ -7,24 +7,36 @@
 
 use super::io_kit::*;
 use super::FfDevice;
-use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo};
+use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
 
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRetained, CFRunLoop, Type};
 use objc2_io_kit::{
     kHIDPage_GenericDesktop, kHIDPage_VendorDefinedStart, kHIDUsage_GD_GamePad,
-    kHIDUsage_GD_Joystick, kHIDUsage_GD_MultiAxisController, IOHIDDevice, IOHIDElement, IOHIDValue,
-    IOReturn,
+    kHIDUsage_GD_Joystick, kHIDUsage_GD_MultiAxisController, kIOHIDOptionsTypeNone,
+    kIOReturnSuccess, IOHIDDevice, IOHIDElement, IOHIDValue, IOReturn,
 };
 use uuid::Uuid;
 use vec_map::VecMap;
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::os::raw::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerExit {
+    Stopped,
+    Panicked,
+    Failed,
+    TimedOut,
+    StopSignalFailed,
+}
 
 #[derive(Debug)]
 pub struct Gilrs {
@@ -33,6 +45,7 @@ pub struct Gilrs {
     rx: Receiver<(Event, Option<Device>)>,
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
+    completion: Option<Receiver<WorkerExit>>,
 }
 
 impl Gilrs {
@@ -42,7 +55,7 @@ impl Gilrs {
 
         let (tx, rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
-        let join_handle = Self::spawn_thread(tx, device_infos.clone(), stop_rx);
+        let (join_handle, completion) = Self::spawn_thread(tx, device_infos.clone(), stop_rx)?;
 
         Ok(Gilrs {
             gamepads,
@@ -50,6 +63,7 @@ impl Gilrs {
             rx,
             stop_tx: Some(stop_tx),
             join_handle: Some(join_handle),
+            completion: Some(completion),
         })
     }
 
@@ -57,57 +71,73 @@ impl Gilrs {
         tx: Sender<(Event, Option<Device>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
         stop_rx: Receiver<()>,
-    ) -> JoinHandle<()> {
-        thread::Builder::new()
+    ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
+        let (completion_tx, completion) = mpsc::sync_channel(1);
+        let join_handle = thread::Builder::new()
             .name("gilrs".to_owned())
             .spawn(move || {
-                let manager = match new_manager() {
-                    Some(manager) => manager,
-                    None => {
-                        error!("Failed to create IOHIDManager object");
-                        return;
+                let exit = match catch_unwind(AssertUnwindSafe(|| {
+                    Self::run_iohid_thread(tx, device_infos, stop_rx)
+                })) {
+                    Ok(Ok(())) => WorkerExit::Stopped,
+                    Ok(Err(error)) => {
+                        error!("macOS IOHID worker cleanup failed: {error:?}");
+                        WorkerExit::Failed
+                    }
+                    Err(_) => {
+                        error!("macOS IOHID worker panicked");
+                        WorkerExit::Panicked
                     }
                 };
-
-                let rl = CFRunLoop::current().unwrap();
-
-                // SAFETY: We pass the current thread's runloop, so the
-                // callback will be run on this thread below.
-                unsafe { manager.schedule_with_run_loop(&rl, kCFRunLoopDefaultMode.unwrap()) };
-
-                // Keep one owned callback context alive for the entire IOHID run-loop
-                // lifetime. The previous code registered pointers to temporary tuples.
-                let context = Arc::new(Context {
-                    tx: tx.clone(),
-                    device_infos: device_infos.clone(),
-                });
-                // SAFETY: `context` is owned by this closure and remains alive until
-                // after the run loop has stopped and callbacks have been unregistered.
-                let context_ptr = Arc::as_ptr(&context) as *mut c_void;
-                unsafe {
-                    manager.register_device_matching_callback(Some(device_matching_cb), context_ptr)
-                };
-
-                // SAFETY: Same as above.
-                unsafe {
-                    manager.register_device_removal_callback(Some(device_removal_cb), context_ptr)
-                };
-
-                // SAFETY: Same as above.
-                unsafe { manager.register_input_value_callback(Some(input_value_cb), context_ptr) };
-
-                loop {
-                    match stop_rx.try_recv() {
-                        Ok(()) | Err(TryRecvError::Disconnected) => break,
-                        Err(TryRecvError::Empty) => {}
-                    }
-                    CFRunLoop::run_in_mode(None, 0.1, false);
-                }
-
-                // SAFETY: There are no threading requirements from this.
-                unsafe { manager.unschedule_from_run_loop(&rl, kCFRunLoopDefaultMode.unwrap()) };
+                let _ = completion_tx.send(exit);
             })
-            .expect("failed to spawn thread")
+            .map_err(|error| PlatformError::Other(Box::new(error)))?;
+
+        Ok((join_handle, completion))
+    }
+
+    fn run_iohid_thread(
+        tx: Sender<(Event, Option<Device>)>,
+        device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
+        stop_rx: Receiver<()>,
+    ) -> Result<(), WorkerExit> {
+        let manager = new_manager().ok_or(WorkerExit::Failed)?;
+        let rl = CFRunLoop::current().ok_or(WorkerExit::Failed)?;
+
+        // SAFETY: We pass the current thread's runloop, so the callback will
+        // be run on this thread below.
+        unsafe { manager.schedule_with_run_loop(&rl, kCFRunLoopDefaultMode.unwrap()) };
+
+        // Keep one owned callback context alive for the entire IOHID run-loop
+        // lifetime. The previous code registered pointers to temporary tuples.
+        let context = Arc::new(Context { tx, device_infos });
+        // SAFETY: `context` is owned by this function and remains alive until
+        // after the run loop has stopped and the manager has been closed.
+        let context_ptr = Arc::as_ptr(&context) as *mut c_void;
+        unsafe { manager.register_device_matching_callback(Some(device_matching_cb), context_ptr) };
+
+        // SAFETY: Same as above.
+        unsafe { manager.register_device_removal_callback(Some(device_removal_cb), context_ptr) };
+
+        // SAFETY: Same as above.
+        unsafe { manager.register_input_value_callback(Some(input_value_cb), context_ptr) };
+
+        loop {
+            match stop_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+            CFRunLoop::run_in_mode(None, 0.1, false);
+        }
+
+        // SAFETY: There are no threading requirements from this.
+        unsafe { manager.unschedule_from_run_loop(&rl, kCFRunLoopDefaultMode.unwrap()) };
+        let close_result = manager.close(kIOHIDOptionsTypeNone);
+        drop(context);
+        if close_result != kIOReturnSuccess {
+            return Err(WorkerExit::Failed);
+        }
+        Ok(())
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
@@ -178,16 +208,72 @@ impl Gilrs {
     pub fn last_gamepad_hint(&self) -> usize {
         self.gamepads.len()
     }
+    pub(crate) fn shutdown(&mut self) -> Result<(), ShutdownError> {
+        self.stop_and_join().map_err(|error| match error {
+            WorkerExit::Stopped | WorkerExit::Failed => ShutdownError::WorkerFailed,
+            WorkerExit::Panicked => ShutdownError::WorkerPanicked,
+            WorkerExit::TimedOut => ShutdownError::TimedOut,
+            WorkerExit::StopSignalFailed => ShutdownError::StopSignalFailed,
+        })
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), WorkerExit> {
+        let Some(join_handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+
+        let stop_result = self
+            .stop_tx
+            .take()
+            .map(|stop_tx| stop_tx.send(()))
+            .unwrap_or(Ok(()));
+        let completion = self
+            .completion
+            .take()
+            .map(|completion| completion.recv_timeout(SHUTDOWN_TIMEOUT));
+
+        let result = match completion {
+            Some(Ok(WorkerExit::Stopped)) => Ok(()),
+            Some(Ok(WorkerExit::Failed)) => Err(WorkerExit::Failed),
+            Some(Ok(WorkerExit::Panicked)) => Err(WorkerExit::Panicked),
+            Some(Ok(WorkerExit::TimedOut | WorkerExit::StopSignalFailed)) => {
+                Err(WorkerExit::StopSignalFailed)
+            }
+            Some(Err(mpsc::RecvTimeoutError::Timeout)) => Err(WorkerExit::TimedOut),
+            Some(Err(mpsc::RecvTimeoutError::Disconnected)) => Err(WorkerExit::StopSignalFailed),
+            None => Err(WorkerExit::StopSignalFailed),
+        };
+
+        if stop_result.is_err()
+            && !matches!(result, Ok(()))
+            && !matches!(result, Err(WorkerExit::Panicked) | Err(WorkerExit::Failed))
+        {
+            return Err(WorkerExit::StopSignalFailed);
+        }
+
+        if matches!(
+            result,
+            Ok(()) | Err(WorkerExit::Panicked) | Err(WorkerExit::Failed)
+        ) {
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while !join_handle.is_finished() {
+                if Instant::now() >= deadline {
+                    return Err(WorkerExit::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            return join_handle.join().map_err(|_| WorkerExit::Panicked);
+        }
+
+        Err(result.err().unwrap_or(WorkerExit::StopSignalFailed))
+    }
 }
 
 impl Drop for Gilrs {
     fn drop(&mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-        if let Some(join_handle) = self.join_handle.take() {
-            if let Err(error) = join_handle.join() {
-                error!("macOS IOHID worker join failed: {error:?}");
+        if self.join_handle.is_some() {
+            if let Err(error) = self.stop_and_join() {
+                error!("macOS IOHID worker shutdown was not clean: {error:?}");
             }
         }
     }
