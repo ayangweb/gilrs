@@ -21,9 +21,9 @@ use vec_map::VecMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::os::raw::c_void;
 use std::ptr::NonNull;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -31,6 +31,8 @@ pub struct Gilrs {
     gamepads: Vec<Gamepad>,
     device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
     rx: Receiver<(Event, Option<Device>)>,
+    stop_tx: Option<Sender<()>>,
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl Gilrs {
@@ -39,19 +41,23 @@ impl Gilrs {
         let device_infos = Arc::new(Mutex::new(Vec::new()));
 
         let (tx, rx) = mpsc::channel();
-        Self::spawn_thread(tx, device_infos.clone());
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join_handle = Self::spawn_thread(tx, device_infos.clone(), stop_rx);
 
         Ok(Gilrs {
             gamepads,
             device_infos,
             rx,
+            stop_tx: Some(stop_tx),
+            join_handle: Some(join_handle),
         })
     }
 
     fn spawn_thread(
         tx: Sender<(Event, Option<Device>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
-    ) {
+        stop_rx: Receiver<()>,
+    ) -> JoinHandle<()> {
         thread::Builder::new()
             .name("gilrs".to_owned())
             .spawn(move || {
@@ -90,12 +96,18 @@ impl Gilrs {
                 // SAFETY: Same as above.
                 unsafe { manager.register_input_value_callback(Some(input_value_cb), context_ptr) };
 
-                CFRunLoop::run();
+                loop {
+                    match stop_rx.try_recv() {
+                        Ok(()) | Err(TryRecvError::Disconnected) => break,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    CFRunLoop::run_in_mode(None, 0.1, false);
+                }
 
                 // SAFETY: There are no threading requirements from this.
                 unsafe { manager.unschedule_from_run_loop(&rl, kCFRunLoopDefaultMode.unwrap()) };
             })
-            .expect("failed to spawn thread");
+            .expect("failed to spawn thread")
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
@@ -165,6 +177,19 @@ impl Gilrs {
     /// Returns index greater than index of last connected gamepad.
     pub fn last_gamepad_hint(&self) -> usize {
         self.gamepads.len()
+    }
+}
+
+impl Drop for Gilrs {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            if let Err(error) = join_handle.join() {
+                error!("macOS IOHID worker join failed: {error:?}");
+            }
+        }
     }
 }
 
