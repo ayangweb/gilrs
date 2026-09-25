@@ -1285,14 +1285,23 @@ mod tests {
             max: i32::MAX,
             deadzone: None,
         };
-        let axis = Axis::LeftStickY;
+        let axis = Axis::LeftStickX;
 
         assert_eq!(0., axis_value(&info, -1, axis));
         assert_eq!(0., axis_value(&info, 0, axis));
         assert_eq!(0., axis_value(&info, 1, axis));
 
-        assert_eq!(1.0, axis_value(&info, i32::MIN, axis));
-        assert_eq!(-1.0, axis_value(&info, i32::MAX, axis));
+        assert_eq!(-1.0, axis_value(&info, i32::MIN, axis));
+        assert_eq!(1.0, axis_value(&info, i32::MAX, axis));
+
+        let y_min = if gilrs_core::IS_Y_AXIS_REVERSED {
+            1.0
+        } else {
+            -1.0
+        };
+        let y_max = -y_min;
+        assert_eq!(y_min, axis_value(&info, i32::MIN, Axis::LeftStickY));
+        assert_eq!(y_max, axis_value(&info, i32::MAX, Axis::LeftStickY));
     }
 
     #[test]
