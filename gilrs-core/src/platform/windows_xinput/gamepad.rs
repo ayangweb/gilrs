@@ -6,6 +6,9 @@
 // copied, modified, or distributed except according to those terms.
 
 use super::FfDevice;
+use crate::event_queue::{
+    bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
+};
 use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
 
 use std::error::Error as StdError;
@@ -49,7 +52,7 @@ const MAX_XINPUT_CONTROLLERS: usize = 4;
 #[derive(Debug)]
 pub struct Gilrs {
     gamepads: [Gamepad; MAX_XINPUT_CONTROLLERS],
-    rx: Receiver<Event>,
+    rx: EventReceiver<Event>,
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
     completion: Option<Receiver<WorkerExit>>,
@@ -74,7 +77,7 @@ impl Gilrs {
             connected[id] = gamepads[id].is_connected;
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (stop_tx, stop_rx) = mpsc::channel();
         let (join_handle, completion) =
             Self::spawn_thread(tx, connected, xinput_handle.clone(), stop_rx)?;
@@ -90,22 +93,24 @@ impl Gilrs {
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
-        let ev = self.rx.try_recv().ok();
-        self.handle_evevnt(ev);
-
-        ev
+        let item = self.rx.try_pop()?;
+        let event = self.handle_queue_item(item);
+        self.handle_evevnt(Some(event));
+        Some(event)
     }
 
     pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
-        let ev = if let Some(tiemout) = timeout {
-            self.rx.recv_timeout(tiemout).ok()
-        } else {
-            self.rx.recv().ok()
-        };
+        let item = self.rx.pop_timeout(timeout)?;
+        let event = self.handle_queue_item(item);
+        self.handle_evevnt(Some(event));
+        Some(event)
+    }
 
-        self.handle_evevnt(ev);
-
-        ev
+    fn handle_queue_item(&mut self, item: QueueItem<Event>) -> Event {
+        match item {
+            QueueItem::Event(event) => event,
+            QueueItem::Overflow { dropped } => Event::new(0, EventType::Overflow { dropped }),
+        }
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), ShutdownError> {
@@ -184,7 +189,7 @@ impl Gilrs {
 
     #[allow(clippy::result_large_err)]
     fn spawn_thread(
-        tx: Sender<Event>,
+        tx: EventSender<Event>,
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
         stop_rx: Receiver<()>,
@@ -210,7 +215,7 @@ impl Gilrs {
     }
 
     unsafe fn run_worker(
-        tx: Sender<Event>,
+        tx: EventSender<Event>,
         connected: [bool; MAX_XINPUT_CONTROLLERS],
         xinput_handle: Arc<XInputHandle>,
         stop_rx: Receiver<()>,
@@ -261,233 +266,350 @@ impl Gilrs {
         }
     }
 
-    fn send_xinput_event(tx: &Sender<Event>, event: Event) {
-        if let Err(error) = tx.send(event) {
-            warn!("Failed to send XInput event: {error}");
+    fn send_xinput_event(tx: &EventSender<Event>, event: Event) {
+        let result = tx.push(event);
+        if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
+            warn!("XInput event queue rejected an event: {result:?}");
         }
     }
 
-    fn compare_state(id: usize, g: &XGamepad, pg: &XGamepad, tx: &Sender<Event>) {
+    fn send_xinput_axis_event(tx: &EventSender<Event>, id: usize, code: u32, event: Event) {
+        let key = ((id as u64) << 32) | code as u64;
+        let result = tx.push_latest(key, event);
+        if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
+            warn!("XInput axis queue rejected an event: {result:?}");
+        }
+    }
+
+    fn compare_state(id: usize, g: &XGamepad, pg: &XGamepad, tx: &EventSender<Event>) {
         if g.bLeftTrigger != pg.bLeftTrigger {
-            let _ = tx.send(Event::new(
+            Self::send_xinput_axis_event(
+                tx,
                 id,
-                EventType::AxisValueChanged(
-                    g.bLeftTrigger as i32,
-                    crate::native_ev_codes::AXIS_LT2,
+                crate::native_ev_codes::AXIS_LT2.into_u32(),
+                Event::new(
+                    id,
+                    EventType::AxisValueChanged(
+                        g.bLeftTrigger as i32,
+                        crate::native_ev_codes::AXIS_LT2,
+                    ),
                 ),
-            ));
+            );
         }
         if g.bRightTrigger != pg.bRightTrigger {
-            let _ = tx.send(Event::new(
+            Self::send_xinput_axis_event(
+                tx,
                 id,
-                EventType::AxisValueChanged(
-                    g.bRightTrigger as i32,
-                    crate::native_ev_codes::AXIS_RT2,
+                crate::native_ev_codes::AXIS_RT2.into_u32(),
+                Event::new(
+                    id,
+                    EventType::AxisValueChanged(
+                        g.bRightTrigger as i32,
+                        crate::native_ev_codes::AXIS_RT2,
+                    ),
                 ),
-            ));
+            );
         }
         if g.sThumbLX != pg.sThumbLX {
-            let _ = tx.send(Event::new(
+            Self::send_xinput_axis_event(
+                tx,
                 id,
-                EventType::AxisValueChanged(
-                    g.sThumbLX as i32,
-                    crate::native_ev_codes::AXIS_LSTICKX,
+                crate::native_ev_codes::AXIS_LSTICKX.into_u32(),
+                Event::new(
+                    id,
+                    EventType::AxisValueChanged(
+                        g.sThumbLX as i32,
+                        crate::native_ev_codes::AXIS_LSTICKX,
+                    ),
                 ),
-            ));
+            );
         }
         if g.sThumbLY != pg.sThumbLY {
-            let _ = tx.send(Event::new(
+            Self::send_xinput_axis_event(
+                tx,
                 id,
-                EventType::AxisValueChanged(
-                    g.sThumbLY as i32,
-                    crate::native_ev_codes::AXIS_LSTICKY,
+                crate::native_ev_codes::AXIS_LSTICKY.into_u32(),
+                Event::new(
+                    id,
+                    EventType::AxisValueChanged(
+                        g.sThumbLY as i32,
+                        crate::native_ev_codes::AXIS_LSTICKY,
+                    ),
                 ),
-            ));
+            );
         }
         if g.sThumbRX != pg.sThumbRX {
-            let _ = tx.send(Event::new(
+            Self::send_xinput_axis_event(
+                tx,
                 id,
-                EventType::AxisValueChanged(
-                    g.sThumbRX as i32,
-                    crate::native_ev_codes::AXIS_RSTICKX,
+                crate::native_ev_codes::AXIS_RSTICKX.into_u32(),
+                Event::new(
+                    id,
+                    EventType::AxisValueChanged(
+                        g.sThumbRX as i32,
+                        crate::native_ev_codes::AXIS_RSTICKX,
+                    ),
                 ),
-            ));
+            );
         }
         if g.sThumbRY != pg.sThumbRY {
-            let _ = tx.send(Event::new(
+            Self::send_xinput_axis_event(
+                tx,
                 id,
-                EventType::AxisValueChanged(
-                    g.sThumbRY as i32,
-                    crate::native_ev_codes::AXIS_RSTICKY,
+                crate::native_ev_codes::AXIS_RSTICKY.into_u32(),
+                Event::new(
+                    id,
+                    EventType::AxisValueChanged(
+                        g.sThumbRY as i32,
+                        crate::native_ev_codes::AXIS_RSTICKY,
+                    ),
                 ),
-            ));
+            );
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_UP) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_DPAD_UP != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_UP),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_UP),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_DPAD_UP != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_UP),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_UP),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_DOWN) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_DOWN),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_DOWN),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_DOWN),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_DOWN),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_LEFT) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_LEFT),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_LEFT),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_LEFT),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_LEFT),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_DPAD_RIGHT) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_RIGHT),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_RIGHT),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_DPAD_RIGHT),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_DPAD_RIGHT),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_START) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_START != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_START),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_START),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_START != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_START),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_START),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_BACK) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_BACK != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_SELECT),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_SELECT),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_BACK != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_SELECT),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_SELECT),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_LEFT_THUMB) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_LEFT_THUMB != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_LTHUMB),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_LTHUMB),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_LEFT_THUMB != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_LTHUMB),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_LTHUMB),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_RIGHT_THUMB) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_RTHUMB),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_RTHUMB),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_RTHUMB),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_RTHUMB),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_LEFT_SHOULDER) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_LT),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_LT),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(id, EventType::ButtonPressed(crate::native_ev_codes::BTN_LT)),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_LT),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_RIGHT_SHOULDER) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_RT),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_RT),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(id, EventType::ButtonPressed(crate::native_ev_codes::BTN_RT)),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_RT),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_A) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_A != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_SOUTH),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_SOUTH),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_A != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_SOUTH),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_SOUTH),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_B) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_B != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_EAST),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_EAST),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_B != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_EAST),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_EAST),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_X) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_X != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_WEST),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_WEST),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_X != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_WEST),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_WEST),
+                    ),
+                ),
             };
         }
         if !is_mask_eq(g.wButtons, pg.wButtons, XINPUT_GAMEPAD_Y) {
-            let _ = match g.wButtons & XINPUT_GAMEPAD_Y != 0 {
-                true => tx.send(Event::new(
-                    id,
-                    EventType::ButtonPressed(crate::native_ev_codes::BTN_NORTH),
-                )),
-                false => tx.send(Event::new(
-                    id,
-                    EventType::ButtonReleased(crate::native_ev_codes::BTN_NORTH),
-                )),
+            match g.wButtons & XINPUT_GAMEPAD_Y != 0 {
+                true => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonPressed(crate::native_ev_codes::BTN_NORTH),
+                    ),
+                ),
+                false => Self::send_xinput_event(
+                    tx,
+                    Event::new(
+                        id,
+                        EventType::ButtonReleased(crate::native_ev_codes::BTN_NORTH),
+                    ),
+                ),
             };
         }
     }
@@ -495,6 +617,10 @@ impl Gilrs {
 
 impl Drop for Gilrs {
     fn drop(&mut self) {
+        let dropped = self.rx.dropped_count();
+        if dropped > 0 {
+            warn!("XInput event queue dropped {dropped} events");
+        }
         if self.join_handle.is_some() {
             if let Err(error) = self.stop_and_join() {
                 warn!("XInput worker shutdown was not clean: {error:?}");

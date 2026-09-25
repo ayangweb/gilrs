@@ -6,12 +6,17 @@
 // copied, modified, or distributed except according to those terms.
 
 use super::FfDevice;
+use crate::event_queue::{
+    bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
+};
 use crate::native_ev_codes as nec;
 use crate::{utils, AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
 
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -92,16 +97,40 @@ struct WorkerEventHandler {
 // alive until it is removed.
 unsafe impl Send for WorkerEventHandler {}
 
-fn send_wgi_event(tx: &Sender<WgiEvent>, event: WgiEvent) {
-    if let Err(error) = tx.send(event) {
-        warn!("Failed to send WGI event: {error}");
+fn send_wgi_event(tx: &EventSender<WgiEvent>, event: WgiEvent) {
+    let result = tx.push(event);
+    if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
+        warn!("WGI event queue rejected an event: {result:?}");
+    }
+}
+
+fn controller_axis_key(controller: &RawGameController, code: u32) -> Option<u64> {
+    let id = controller.NonRoamableId().ok()?.to_string_lossy();
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    code.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn send_wgi_axis_event(
+    tx: &EventSender<WgiEvent>,
+    controller: &RawGameController,
+    code: u32,
+    event: WgiEvent,
+) {
+    let result = match controller_axis_key(controller, code) {
+        Some(key) => tx.push_latest(key, event),
+        None => tx.push(event),
+    };
+    if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
+        warn!("WGI axis queue rejected an event: {result:?}");
     }
 }
 
 #[derive(Debug)]
 pub struct Gilrs {
     gamepads: Vec<Gamepad>,
-    rx: Receiver<WgiEvent>,
+    rx: EventReceiver<WgiEvent>,
     join_handle: Option<JoinHandle<()>>,
     stop_tx: Option<Sender<()>>,
     completion: Option<Receiver<WorkerExit>>,
@@ -126,7 +155,7 @@ impl Gilrs {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (stop_tx, stop_rx) = mpsc::channel();
         let (join_handle, completion) = Self::spawn_thread(tx, stop_rx)?;
         Ok(Gilrs {
@@ -139,7 +168,7 @@ impl Gilrs {
     }
 
     fn spawn_thread(
-        tx: Sender<WgiEvent>,
+        tx: EventSender<WgiEvent>,
         stop_rx: Receiver<()>,
     ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
         let added_tx = tx.clone();
@@ -241,7 +270,7 @@ impl Gilrs {
         Ok((join_handle, completion))
     }
 
-    fn run_worker(tx: Sender<WgiEvent>, stop_rx: Receiver<()>) {
+    fn run_worker(tx: EventSender<WgiEvent>, stop_rx: Receiver<()>) {
         let mut controllers: Vec<RawGameController> = Vec::new();
         // To avoid allocating every update, store old and new readings for every controller
         // and swap their memory
@@ -331,22 +360,20 @@ impl Gilrs {
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
         self.rx
-            .try_recv()
-            .ok()
-            .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
+            .try_pop()
+            .and_then(|item| self.handle_queue_item(item))
     }
 
     pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
-        if let Some(timeout) = timeout {
-            self.rx
-                .recv_timeout(timeout)
-                .ok()
-                .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
-        } else {
-            self.rx
-                .recv()
-                .ok()
-                .and_then(|wgi_event: WgiEvent| self.handle_event(wgi_event))
+        self.rx
+            .pop_timeout(timeout)
+            .and_then(|item| self.handle_queue_item(item))
+    }
+
+    fn handle_queue_item(&mut self, item: QueueItem<WgiEvent>) -> Option<Event> {
+        match item {
+            QueueItem::Event(wgi_event) => self.handle_event(wgi_event),
+            QueueItem::Overflow { dropped } => Some(Event::new(0, EventType::Overflow { dropped })),
         }
     }
 
@@ -451,6 +478,10 @@ impl Gilrs {
 
 impl Drop for Gilrs {
     fn drop(&mut self) {
+        let dropped = self.rx.dropped_count();
+        if dropped > 0 {
+            warn!("WGI event queue dropped {dropped} events");
+        }
         if self.join_handle.is_some() {
             if let Err(error) = self.stop_and_join() {
                 warn!("WGI worker shutdown was not clean: {error:?}");
@@ -544,7 +575,7 @@ impl Reading {
         old: &Self,
         new: &Self,
         controller: &RawGameController,
-        tx: &Sender<WgiEvent>,
+        tx: &EventSender<WgiEvent>,
     ) {
         match (old, new) {
             // WGI RawGameController
@@ -561,7 +592,12 @@ impl Reading {
                                 index: index as u32,
                             }),
                         );
-                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
+                        send_wgi_axis_event(
+                            tx,
+                            controller,
+                            index as u32,
+                            WgiEvent::new(controller.clone(), event_type),
+                        )
                     }
                 }
                 for index in 0..new.buttons.len() {
@@ -591,7 +627,12 @@ impl Reading {
                                 index: (index * 2) as u32,
                             }),
                         );
-                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
+                        send_wgi_axis_event(
+                            tx,
+                            controller,
+                            (index * 2) as u32,
+                            WgiEvent::new(controller.clone(), event_type),
+                        )
                     }
                     if old_y != new_y {
                         let event_type = EventType::AxisValueChanged(
@@ -601,7 +642,12 @@ impl Reading {
                                 index: (index * 2) as u32 + 1,
                             }),
                         );
-                        send_wgi_event(tx, WgiEvent::new(controller.clone(), event_type))
+                        send_wgi_axis_event(
+                            tx,
+                            controller,
+                            (index * 2) as u32 + 1,
+                            WgiEvent::new(controller.clone(), event_type),
+                        )
                     }
                 }
             }
@@ -618,8 +664,10 @@ impl Reading {
                 ];
                 for (new, old, code, multiplier) in axes {
                     if new != old {
-                        send_wgi_event(
+                        send_wgi_axis_event(
                             tx,
+                            controller,
+                            code.into_u32(),
                             WgiEvent::new(
                                 controller.clone(),
                                 EventType::AxisValueChanged(

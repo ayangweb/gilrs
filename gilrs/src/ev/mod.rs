@@ -106,6 +106,9 @@ pub enum EventType {
     Dropped,
     /// A force feedback effect has ran for its duration and stopped.
     ForceFeedbackEffectCompleted,
+    /// The backend event queue discarded one or more events. Consumers must
+    /// reconcile authoritative device state before trusting pressed state.
+    BackendOverflow { dropped: u64 },
 }
 
 #[repr(u16)]

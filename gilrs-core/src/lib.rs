@@ -9,6 +9,7 @@ use std::error;
 use std::time::Duration;
 use std::time::SystemTime;
 
+mod event_queue;
 mod platform;
 pub mod utils;
 
@@ -57,6 +58,11 @@ pub enum EventType {
     AxisValueChanged(i32, EvCode),
     Connected,
     Disconnected,
+    /// The bounded backend queue discarded one or more events. Consumers must
+    /// reconcile authoritative device state before trusting pressed state.
+    Overflow {
+        dropped: u64,
+    },
 }
 
 /// Holds information about expected axis range and deadzone.

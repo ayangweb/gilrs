@@ -373,6 +373,9 @@ impl Gilrs {
 
                             EventType::Disconnected
                         }
+                        RawEventType::Overflow { dropped } => {
+                            EventType::BackendOverflow { dropped }
+                        }
                         _ => {
                             unimplemented!()
                         }
@@ -416,7 +419,11 @@ impl Gilrs {
                 data.state
                     .update_axis(nec, AxisData::new(value, counter, event.time));
             }
-            Disconnected | Connected | Dropped | ForceFeedbackEffectCompleted => (),
+            Disconnected
+            | Connected
+            | Dropped
+            | ForceFeedbackEffectCompleted
+            | EventType::BackendOverflow { .. } => (),
         }
     }
 

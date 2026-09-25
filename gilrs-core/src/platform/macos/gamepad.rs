@@ -7,6 +7,9 @@
 
 use super::io_kit::*;
 use super::FfDevice;
+use crate::event_queue::{
+    bounded, EnqueueResult, EventReceiver, EventSender, QueueItem, DEFAULT_EVENT_QUEUE_CAPACITY,
+};
 use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo, ShutdownError};
 
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRetained, CFRunLoop, Type};
@@ -42,7 +45,7 @@ enum WorkerExit {
 pub struct Gilrs {
     gamepads: Vec<Gamepad>,
     device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
-    rx: Receiver<(Event, Option<Device>)>,
+    rx: EventReceiver<(Event, Option<Device>)>,
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
     completion: Option<Receiver<WorkerExit>>,
@@ -53,7 +56,7 @@ impl Gilrs {
         let gamepads = Vec::new();
         let device_infos = Arc::new(Mutex::new(Vec::new()));
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = bounded(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (stop_tx, stop_rx) = mpsc::channel();
         let (join_handle, completion) = Self::spawn_thread(tx, device_infos.clone(), stop_rx)?;
 
@@ -68,7 +71,7 @@ impl Gilrs {
     }
 
     fn spawn_thread(
-        tx: Sender<(Event, Option<Device>)>,
+        tx: EventSender<(Event, Option<Device>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
         stop_rx: Receiver<()>,
     ) -> Result<(JoinHandle<()>, Receiver<WorkerExit>), PlatformError> {
@@ -97,7 +100,7 @@ impl Gilrs {
     }
 
     fn run_iohid_thread(
-        tx: Sender<(Event, Option<Device>)>,
+        tx: EventSender<(Event, Option<Device>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
         stop_rx: Receiver<()>,
     ) -> Result<(), WorkerExit> {
@@ -141,18 +144,22 @@ impl Gilrs {
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
-        let event = self.rx.try_recv().ok();
-        self.handle_event(event)
+        self.rx
+            .try_pop()
+            .and_then(|item| self.handle_queue_item(item))
     }
 
     pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
-        let event = if let Some(timeout) = timeout {
-            self.rx.recv_timeout(timeout).ok()
-        } else {
-            self.rx.recv().ok()
-        };
+        self.rx
+            .pop_timeout(timeout)
+            .and_then(|item| self.handle_queue_item(item))
+    }
 
-        self.handle_event(event)
+    fn handle_queue_item(&mut self, item: QueueItem<(Event, Option<Device>)>) -> Option<Event> {
+        match item {
+            QueueItem::Event(event) => self.handle_event(Some(event)),
+            QueueItem::Overflow { dropped } => Some(Event::new(0, EventType::Overflow { dropped })),
+        }
     }
 
     fn handle_event(&mut self, event: Option<(Event, Option<Device>)>) -> Option<Event> {
@@ -271,6 +278,10 @@ impl Gilrs {
 
 impl Drop for Gilrs {
     fn drop(&mut self) {
+        let dropped = self.rx.dropped_count();
+        if dropped > 0 {
+            warn!("macOS IOHID event queue dropped {dropped} events");
+        }
         if self.join_handle.is_some() {
             if let Err(error) = self.stop_and_join() {
                 error!("macOS IOHID worker shutdown was not clean: {error:?}");
@@ -746,8 +757,32 @@ pub mod native_ev_codes {
 }
 
 struct Context {
-    tx: Sender<(Event, Option<Device>)>,
+    tx: EventSender<(Event, Option<Device>)>,
     device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
+}
+
+fn context_event_key(event: &Event) -> Option<u64> {
+    match event.event {
+        EventType::AxisValueChanged(_, code) => {
+            Some(((event.id as u64) << 32) | code.into_u32() as u64)
+        }
+        _ => None,
+    }
+}
+
+fn send_context_event(
+    tx: &EventSender<(Event, Option<Device>)>,
+    event: Event,
+    device: Option<Device>,
+    latest: bool,
+) {
+    let result = match (latest, context_event_key(&event)) {
+        (true, Some(key)) => tx.push_latest(key, (event, device)),
+        _ => tx.push((event, device)),
+    };
+    if matches!(result, EnqueueResult::Overflowed | EnqueueResult::Closed) {
+        warn!("macOS IOHID event queue rejected an event: {result:?}");
+    }
 }
 
 extern "C-unwind" fn device_matching_cb(
@@ -820,10 +855,12 @@ extern "C-unwind" fn device_matching_cb(
             device_infos.len() - 1
         }
     };
-    let _ = tx.send((
+    send_context_event(
+        tx,
         Event::new(id, EventType::Connected),
         Some(Device(device.retain())),
-    ));
+        false,
+    );
 }
 
 #[allow(clippy::type_complexity)]
@@ -860,7 +897,7 @@ unsafe extern "C-unwind" fn device_removal_cb(
         }
     };
 
-    let _ = tx.send((Event::new(id, EventType::Disconnected), None));
+    send_context_event(tx, Event::new(id, EventType::Disconnected), None, false);
 }
 
 #[allow(clippy::type_complexity)]
@@ -928,20 +965,20 @@ unsafe extern "C-unwind" fn input_value_cb(
                 crate::EvCode(EvCode { page, usage }),
             ),
         );
-        let _ = tx.send((event, None));
+        send_context_event(tx, event, None, true);
     } else if element_is_button(type_, page, usage) {
         if value.integer_value() == 0 {
             let event = Event::new(
                 id,
                 EventType::ButtonReleased(crate::EvCode(EvCode { page, usage })),
             );
-            let _ = tx.send((event, None));
+            send_context_event(tx, event, None, false);
         } else {
             let event = Event::new(
                 id,
                 EventType::ButtonPressed(crate::EvCode(EvCode { page, usage })),
             );
-            let _ = tx.send((event, None));
+            send_context_event(tx, event, None, false);
         }
     } else if element_is_hat(type_, page, usage) {
         // Hat switch values are reported with a range of usually 8 numbers (sometimes 4). The logic
@@ -1006,7 +1043,7 @@ unsafe extern "C-unwind" fn input_value_cb(
             ),
         );
 
-        let _ = tx.send((x_axis_event, None));
-        let _ = tx.send((y_axis_event, None));
+        send_context_event(tx, x_axis_event, None, true);
+        send_context_event(tx, y_axis_event, None, true);
     }
 }
