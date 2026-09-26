@@ -145,7 +145,15 @@ impl Gilrs {
                 }
                 Err(TryRecvError::Empty) => {}
             }
-            CFRunLoop::run_in_mode(None, 0.1, false);
+            // `CFRunLoopRunInMode` takes the mode as a raw `CFStringRef`, and a
+            // null mode makes CoreFoundation log `invalid mode '(null)'` and
+            // return immediately instead of waiting. Passing `None` here
+            // therefore never blocked: this loop spun as fast as the CPU allowed
+            // and an idle backend cost a full core. The default mode is the mode
+            // the manager was scheduled on above, and it is a process-lifetime
+            // constant.
+            let default_mode = unsafe { kCFRunLoopDefaultMode };
+            CFRunLoop::run_in_mode(default_mode, 0.1, false);
         }
 
         // SAFETY: There are no threading requirements from this.
@@ -1151,4 +1159,127 @@ unsafe extern "C-unwind" fn input_value_cb(
     };
 
     emit_value_event(id, value, tx, epoch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_core_foundation::CFRunLoopRunResult;
+    use std::time::Instant;
+
+    /// Process CPU time consumed so far, in seconds.
+    fn process_cpu_seconds() -> f64 {
+        // SAFETY: `getrusage` only writes the provided struct.
+        unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+                return f64::NAN;
+            }
+            let to_seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+            to_seconds(usage.ru_utime) + to_seconds(usage.ru_stime)
+        }
+    }
+
+    /// An idle backend must not consume a core.
+    ///
+    /// The worker loop used to poll the run loop with a null mode, which makes
+    /// CoreFoundation return immediately instead of waiting, so the loop spun
+    /// for as long as the backend existed and an idle gamepad backend cost a full
+    /// core. This is the regression test for that: it creates a real backend with
+    /// no gamepad attached and requires the idle CPU cost to stay low.
+    #[test]
+    fn idle_backend_does_not_spin() {
+        // A host without a usable IOHID manager cannot run this backend at all.
+        let Ok(gilrs) = Gilrs::new() else {
+            eprintln!("skipping: IOHID backend unavailable on this host");
+            return;
+        };
+
+        // Let device enumeration and start-up churn settle before measuring.
+        thread::sleep(Duration::from_millis(250));
+
+        let window = Duration::from_millis(1500);
+        let cpu_before = process_cpu_seconds();
+        let started = Instant::now();
+        thread::sleep(window);
+        let cpu_used = process_cpu_seconds() - cpu_before;
+        let wall = started.elapsed().as_secs_f64();
+
+        drop(gilrs);
+
+        assert!(
+            cpu_used.is_finite(),
+            "could not read process CPU time on this host"
+        );
+        // A correct backend idles near zero. The threshold is loose because this
+        // measures the whole process while other tests may share it, but it is far
+        // below the full core a spinning worker used.
+        let budget = wall * 0.35;
+        assert!(
+            cpu_used < budget,
+            "idle backend used {cpu_used:.3}s CPU over {wall:.3}s wall, \
+             above the {budget:.3}s idle budget: the worker is spinning"
+        );
+    }
+
+    /// Pins the two properties the IOHID worker loop depends on.
+    ///
+    /// The loop used to call `CFRunLoop::run_in_mode(None, 0.1, false)`. A null
+    /// mode makes CoreFoundation log `invalid mode '(null)'` and return
+    /// immediately instead of waiting, so the loop never blocked: it spun as
+    /// fast as the CPU allowed and an idle backend burned a full core. This test
+    /// schedules a real manager, then requires the run loop to actually wait for
+    /// the poll interval, which is what a correct mode buys, and confirms that a
+    /// null mode does not.
+    #[test]
+    fn scheduled_run_loop_blocks_for_the_poll_interval() {
+        // The poll interval the worker loop uses.
+        const POLL: f64 = 0.1;
+
+        let probe = thread::spawn(|| {
+            let manager = new_manager().expect("iohid manager");
+            let run_loop = CFRunLoop::current().expect("run loop");
+            // SAFETY: the default mode is a process-lifetime CoreFoundation
+            // constant, and this is the mode the manager is scheduled on.
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            let mode_ref = mode.expect("default run loop mode");
+
+            // SAFETY: `run_loop` is this thread's run loop and outlives the
+            // schedule; the manager is unscheduled before it is dropped.
+            unsafe { manager.schedule_with_run_loop(&run_loop, mode_ref) };
+
+            let time = |mode: Option<&objc2_core_foundation::CFRunLoopMode>| {
+                let started = Instant::now();
+                let result = CFRunLoop::run_in_mode(mode, POLL, false);
+                (started.elapsed(), result)
+            };
+
+            let (waited, result) = time(mode);
+            // The regression itself: a null mode returns without waiting.
+            let (null_waited, _) = time(None);
+
+            // SAFETY: no threading requirements on this call.
+            unsafe { manager.unschedule_from_run_loop(&run_loop, mode_ref) };
+            (waited, result, null_waited)
+        });
+
+        let (waited, result, null_waited) = probe.join().expect("probe thread");
+
+        assert!(
+            waited >= Duration::from_millis(50),
+            "run loop returned after {waited:?} instead of waiting ~{POLL}s, \
+             so the worker loop would spin instead of block"
+        );
+        assert_ne!(
+            result,
+            CFRunLoopRunResult::Finished,
+            "run loop reported that it has no sources, so polling it returns \
+             immediately and the worker loop would spin"
+        );
+        assert!(
+            null_waited < Duration::from_millis(50),
+            "a null mode waited {null_waited:?} instead of returning immediately; \
+             CoreFoundation no longer behaves as this fix assumes"
+        );
+    }
 }
