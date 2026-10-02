@@ -577,6 +577,24 @@ impl RawGamepadReading {
     }
 }
 
+/// Scales a Windows Gaming Input raw analog sample into the `i32` domain that
+/// gilrs renormalizes.
+///
+/// `Gamepad::axis_info` reports `EvCodeKind::Axis` as the full signed `i32`
+/// range, which is what `axis_value` maps onto `[-1.0, 1.0]`. The raw sample
+/// therefore has to be scaled over that same range, so a neutral device reading
+/// lands on `0` and both stick directions reach the ends of the range.
+///
+/// SDL's Windows Gaming Input backend instead pre-centers the sample with
+/// `(value * 65535.0) - 32768.0`, which places a neutral reading on `i16::MIN`.
+/// SDL hands that straight to `SDL_PrivateJoystickAxis` and its own axis
+/// normalization removes the offset later, but gilrs renormalizes a second time
+/// and kept the offset: every neutral stick read as `-1.0` and the entire
+/// negative half of its travel clamped to full deflection.
+fn raw_axis_value(device: f64) -> i32 {
+    (device * i32::MAX as f64) as i32
+}
+
 /// Treats switches like a two axes similar to a Directional pad.
 /// Returns a tuple containing the values of the x and y axis.
 /// Value's range is -1 to 1.
@@ -647,8 +665,7 @@ impl Reading {
                 // Axis changes
                 for index in 0..new.axes.len() {
                     if force || old.axes.get(index) != new.axes.get(index) {
-                        // https://github.com/libsdl-org/SDL/blob/6af17369ca773155bd7f39b8801725c4a6d52e4f/src/joystick/windows/SDL_windows_gaming_input.c#L863
-                        let value = ((new.axes[index] * 65535.0) - 32768.0) as i32;
+                        let value = raw_axis_value(new.axes[index]);
                         let event_type = EventType::AxisValueChanged(
                             value,
                             crate::EvCode(EvCode {
@@ -964,9 +981,12 @@ impl Gamepad {
         if self.wgi_gamepad.is_none() {
             return match nec.kind {
                 EvCodeKind::Button => None,
+                // Raw samples are scaled by `raw_axis_value` over the full
+                // signed range, so report that range here instead of the
+                // `i16` range SDL works with.
                 EvCodeKind::Axis => Some(&AxisInfo {
-                    min: i16::MIN as i32,
-                    max: i16::MAX as i32,
+                    min: i32::MIN,
+                    max: i32::MAX,
                     deadzone: None,
                 }),
                 EvCodeKind::Switch => Some(&AxisInfo {
@@ -1233,4 +1253,55 @@ pub mod native_ev_codes {
         AXIS_RT2,
         AXIS_RSTICKY,
     ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{raw_axis_value, AxisInfo};
+
+    const AXIS_RANGE: AxisInfo = AxisInfo {
+        min: i32::MIN,
+        max: i32::MAX,
+        deadzone: None,
+    };
+
+    /// Mirrors `gilrs::gamepad::axis_value`, which renormalizes whatever range
+    /// `Gamepad::axis_info` reports onto `[-1.0, 1.0]`.
+    fn normalized(device: f64) -> f32 {
+        let raw = raw_axis_value(device) as f32;
+        let range = AXIS_RANGE.max as f32 - AXIS_RANGE.min as f32;
+        ((raw - AXIS_RANGE.min as f32) / range * 2.0 - 1.0).clamp(-1.0, 1.0)
+    }
+
+    /// `Gamepad::axis_info` reports `EvCodeKind::Axis` as the full signed
+    /// `i32` range, so a raw sample has to be scaled over that same range.
+    /// SDL's Windows Gaming Input backend pre-centers instead, and gilrs used
+    /// to keep that offset: every neutral stick read as full negative
+    /// deflection and the whole negative half of its travel clamped.
+    #[test]
+    fn raw_axis_value_is_neutral_at_rest_and_spans_the_signed_range() {
+        assert_eq!(0, raw_axis_value(0.0));
+        assert_eq!(i32::MAX, raw_axis_value(1.0));
+        assert_eq!(-i32::MAX, raw_axis_value(-1.0));
+
+        assert!(normalized(0.0).abs() <= f32::EPSILON);
+        assert_eq!(-1.0, normalized(-1.0));
+        assert_eq!(1.0, normalized(1.0));
+    }
+
+    /// The center of the range must not collapse: every step away from neutral
+    /// has to move the reading the same way it moves on the device.
+    #[test]
+    fn raw_axis_value_stays_monotonic_across_the_whole_range() {
+        let mut previous = normalized(-1.0);
+        for step in 1..=1_000 {
+            let device = -1.0 + step as f64 / 500.0;
+            let current = normalized(device);
+            assert!(
+                current >= previous,
+                "reading moved backwards at {device}: {previous} -> {current}"
+            );
+            previous = current;
+        }
+    }
 }
