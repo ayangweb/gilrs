@@ -366,7 +366,10 @@ impl Gilrs {
                         }
                         RawEventType::AxisValueChanged(val, nec) => {
                             // Let's trust at least our backend code
-                            let axis_info = *self.gamepad(id).inner.axis_info(nec).unwrap();
+                            let axis_info = mapped_axis_info(
+                                *self.gamepad(id).inner.axis_info(nec).unwrap(),
+                                self.gamepad(id).axis_or_btn_name(Code(nec)),
+                            );
                             let nec = Code(nec);
 
                             match self.gamepad(id).axis_or_btn_name(nec) {
@@ -1248,6 +1251,24 @@ impl Display for GamepadId {
     }
 }
 
+/// Picks the raw range a native analog value is renormalized over.
+///
+/// A backend reports one raw range per native event code, but the mapping
+/// decides how the value is consumed: `axis_value` reads a signed range as a
+/// position in `[-1.0, 1.0]` and `btn_value` reads an unsigned range as a
+/// magnitude in `[0.0, 1.0]`. Backends that scale raw samples over the full
+/// signed `i32` range therefore have to be re-read from the unsigned range when
+/// a mapping turns that element into a button — an analog trigger — otherwise
+/// a neutral trigger reads as the middle of the scale instead of the released
+/// end, which makes it flap across the axis-to-button threshold on every
+/// sample.
+fn mapped_axis_info(info: AxisInfo, mapped: Option<AxisOrBtn>) -> AxisInfo {
+    match mapped {
+        Some(AxisOrBtn::Btn(_)) if info.min < 0 => AxisInfo { min: 0, ..info },
+        _ => info,
+    }
+}
+
 fn axis_value(info: &AxisInfo, val: i32, axis: Axis) -> f32 {
     let mut range = info.max as f32 - info.min as f32;
     let mut val = val as f32 - info.min as f32;
@@ -1327,7 +1348,14 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::{
-        axis_value, btn_value, Axis, AxisInfo, Event, EventType, GamepadId, PendingEvents,
+        axis_value, btn_value, mapped_axis_info, Axis, AxisInfo, AxisOrBtn, Button, Event,
+        EventType, GamepadId, PendingEvents,
+    };
+
+    const SIGNED: AxisInfo = AxisInfo {
+        min: i32::MIN,
+        max: i32::MAX,
+        deadzone: None,
     };
 
     #[test]
@@ -1399,5 +1427,50 @@ mod tests {
 
         assert_eq!(0.0, btn_value(&info, i32::MIN));
         assert_eq!(1.0, btn_value(&info, i32::MAX));
+    }
+
+    /// A backend that scales raw samples over the full signed `i32` range
+    /// reports the same neutral sample for a stick at rest and for an analog
+    /// trigger at rest. Only the mapping tells them apart, so the raw range
+    /// has to follow it: read as a signed axis the neutral sample is the
+    /// neutral position, read as a signed button it is half of the scale and
+    /// the trigger sits exactly on the axis-to-button threshold.
+    #[test]
+    fn a_signed_raw_element_is_read_over_the_range_its_mapping_asks_for() {
+        let neutral = 0;
+
+        let stick = mapped_axis_info(SIGNED, Some(AxisOrBtn::Axis(Axis::LeftStickX)));
+        assert_eq!(SIGNED.min, stick.min);
+        assert!(axis_value(&stick, neutral, Axis::LeftStickX).abs() <= f32::EPSILON);
+        assert_eq!(-1.0, axis_value(&stick, i32::MIN, Axis::LeftStickX));
+        assert_eq!(1.0, axis_value(&stick, i32::MAX, Axis::LeftStickX));
+
+        let trigger = mapped_axis_info(SIGNED, Some(AxisOrBtn::Btn(Button::LeftTrigger2)));
+        assert_eq!(0, trigger.min);
+        assert_eq!(SIGNED.max, trigger.max);
+        assert_eq!(0.0, btn_value(&trigger, neutral));
+        assert_eq!(0.5, btn_value(&trigger, i32::MAX / 2));
+        assert_eq!(1.0, btn_value(&trigger, i32::MAX));
+    }
+
+    /// Backends that already report the range the mapping needs must be left
+    /// alone, including an unsigned trigger range and an element no mapping
+    /// resolves at all.
+    #[test]
+    fn mapped_axis_info_leaves_an_already_matching_range_untouched() {
+        let unsigned = AxisInfo {
+            min: 0,
+            max: i32::MAX,
+            deadzone: None,
+        };
+        let ranges = [
+            mapped_axis_info(unsigned, Some(AxisOrBtn::Btn(Button::LeftTrigger2))),
+            mapped_axis_info(SIGNED, Some(AxisOrBtn::Axis(Axis::RightStickY))),
+            mapped_axis_info(SIGNED, None),
+        ];
+        assert_eq!(
+            [(0, i32::MAX), (i32::MIN, i32::MAX), (i32::MIN, i32::MAX)],
+            ranges.map(|info| (info.min, info.max)),
+        );
     }
 }
