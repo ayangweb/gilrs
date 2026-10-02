@@ -334,11 +334,18 @@ impl Gilrs {
                 // Find readings for this controller or insert new ones.
                 let index = match readings.iter().position(|(other_id, ..)| id == *other_id) {
                     None => {
-                        let reading = match WgiGamepad::FromGameController(controller) {
-                            Ok(wgi_gamepad) => {
-                                wgi_gamepad.GetCurrentReading().map(Reading::Gamepad)
+                        let reading = match reading_kind(controller) {
+                            ReadingKind::Gamepad => {
+                                match WgiGamepad::FromGameController(controller) {
+                                    Ok(wgi_gamepad) => {
+                                        wgi_gamepad.GetCurrentReading().map(Reading::Gamepad)
+                                    }
+                                    Err(_) => RawGamepadReading::new(controller).map(Reading::Raw),
+                                }
                             }
-                            Err(_) => RawGamepadReading::new(controller).map(Reading::Raw),
+                            ReadingKind::Raw => {
+                                RawGamepadReading::new(controller).map(Reading::Raw)
+                            }
                         };
                         let reading = match reading {
                             Ok(reading) => reading,
@@ -595,6 +602,40 @@ fn raw_axis_value(device: f64) -> i32 {
     (device * i32::MAX as f64) as i32
 }
 
+/// Which Windows Gaming Input reading a controller is polled through.
+///
+/// `Windows.Gaming.Input.Gamepad` is the mapped reading, and Windows only serves
+/// it to the process that owns the foreground window. A controller that can only
+/// be read through it therefore goes silent for as long as the application runs
+/// somewhere else, which for a tray application or a game overlay is the normal
+/// case.
+///
+/// `RawGameController` is served regardless of focus, and it is the reading SDL's
+/// own Windows Gaming Input backend uses for every controller, XInput ones
+/// included. Prefer it whenever the device exposes a raw report at all, and keep
+/// the mapped reading only as the fallback for a device that exposes none.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ReadingKind {
+    Gamepad,
+    Raw,
+}
+
+fn reading_kind(controller: &RawGameController) -> ReadingKind {
+    reading_kind_for(
+        controller.ButtonCount().unwrap_or_default(),
+        controller.AxisCount().unwrap_or_default(),
+        controller.SwitchCount().unwrap_or_default(),
+    )
+}
+
+fn reading_kind_for(buttons: i32, axes: i32, switches: i32) -> ReadingKind {
+    if buttons > 0 || axes > 0 || switches > 0 {
+        ReadingKind::Raw
+    } else {
+        ReadingKind::Gamepad
+    }
+}
+
 /// Treats switches like a two axes similar to a Directional pad.
 /// Returns a tuple containing the values of the x and y axis.
 /// Value's range is -1 to 1.
@@ -825,6 +866,10 @@ pub struct Gamepad {
     /// If the controller has a [Gamepad](https://learn.microsoft.com/en-us/uwp/api/windows.gaming.input.gamepad?view=winrt-22621)
     /// mapping, this is used to access the mapped values.
     wgi_gamepad: Option<WgiGamepad>,
+    /// Which reading this controller is polled through. It decides the event
+    /// codes, the `AxisInfo` ranges and the lookup key for SDL mappings, and it
+    /// is independent of whether the device also has a `Gamepad` mapping.
+    reading: ReadingKind,
     axes: Option<Vec<EvCode>>,
     buttons: Option<Vec<EvCode>>,
 }
@@ -839,14 +884,18 @@ impl Gamepad {
 
         // See if we can cast this to a windows definition of a gamepad
         let wgi_gamepad = WgiGamepad::FromGameController(&raw_game_controller).ok();
+        let reading = reading_kind(&raw_game_controller);
         let name = match raw_game_controller.DisplayName() {
             Ok(hstring) => hstring.to_string_lossy(),
             Err(_) => "unknown".to_string(),
         };
 
-        let uuid = match wgi_gamepad.is_some() {
-            true => Uuid::nil(),
-            false => {
+        let uuid = match reading {
+            // SDL mappings for Xbox controllers on Windows describe the raw
+            // layout — fourteen buttons, a D-pad hat and six axes — which is
+            // exactly what `collect_axes_and_buttons` exposes here, so look the
+            // controller up by its bus/vendor/product GUID.
+            ReadingKind::Raw => {
                 let vendor_id = raw_game_controller.HardwareVendorId().unwrap_or(0).to_be();
                 let product_id = raw_game_controller.HardwareProductId().unwrap_or(0).to_be();
                 let version = 0;
@@ -874,6 +923,9 @@ impl Gamepad {
                     ],
                 )
             }
+            // The mapped reading reports the fixed `native_ev_codes` layout, for
+            // which there is no SDL mapping to look up.
+            ReadingKind::Gamepad => Uuid::nil(),
         };
 
         let mut gamepad = Gamepad {
@@ -884,11 +936,12 @@ impl Gamepad {
             raw_game_controller,
             non_roamable_id,
             wgi_gamepad,
+            reading,
             axes: None,
             buttons: None,
         };
 
-        if gamepad.wgi_gamepad.is_none() {
+        if gamepad.reading == ReadingKind::Raw {
             gamepad
                 .collect_axes_and_buttons()
                 .map_err(|e| PlatformError::Other(Box::new(e)))?;
@@ -977,8 +1030,9 @@ impl Gamepad {
     }
 
     pub(crate) fn axis_info(&self, nec: EvCode) -> Option<&AxisInfo> {
-        // If it isn't a Windows "Gamepad" then return what we want SDL mappings to be able to use
-        if self.wgi_gamepad.is_none() {
+        // A controller polled through the raw report is described by its own
+        // element list, so return what we want SDL mappings to be able to use
+        if self.reading == ReadingKind::Raw {
             return match nec.kind {
                 EvCodeKind::Button => None,
                 // Raw samples are scaled by `raw_axis_value` over the full
@@ -1257,7 +1311,7 @@ pub mod native_ev_codes {
 
 #[cfg(test)]
 mod tests {
-    use super::{raw_axis_value, AxisInfo};
+    use super::{raw_axis_value, reading_kind_for, AxisInfo, ReadingKind};
 
     const AXIS_RANGE: AxisInfo = AxisInfo {
         min: i32::MIN,
@@ -1303,5 +1357,26 @@ mod tests {
             );
             previous = current;
         }
+    }
+
+    /// A device that exposes any raw report is polled through
+    /// `RawGameController`, which Windows serves regardless of which window owns
+    /// the foreground. Only a device with nothing to report raw falls back to the
+    /// mapped `Gamepad` reading.
+    #[test]
+    fn a_device_with_a_raw_report_is_polled_without_the_foreground_window() {
+        for (buttons, axes, switches) in [(14, 6, 1), (1, 0, 0), (0, 1, 0), (0, 0, 1), (20, 4, 0)] {
+            assert_eq!(
+                ReadingKind::Raw,
+                reading_kind_for(buttons, axes, switches),
+                "{buttons}/{axes}/{switches} should be read raw"
+            );
+        }
+    }
+
+    /// With nothing to report raw there is no alternative to the mapped reading.
+    #[test]
+    fn a_device_without_a_raw_report_falls_back_to_the_mapped_reading() {
+        assert_eq!(ReadingKind::Gamepad, reading_kind_for(0, 0, 0));
     }
 }
