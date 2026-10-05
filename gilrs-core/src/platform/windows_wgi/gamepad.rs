@@ -891,10 +891,12 @@ impl Gamepad {
         };
 
         let uuid = match reading {
-            // SDL mappings for Xbox controllers on Windows describe the raw
-            // layout — fourteen buttons, a D-pad hat and six axes — which is
-            // exactly what `collect_axes_and_buttons` exposes here, so look the
-            // controller up by its bus/vendor/product GUID.
+            // The mappings this key resolves to were written against SDL's own
+            // Windows drivers, not against Windows Gaming Input, so the element
+            // order they name is not the one a `RawGameController` reports.
+            // `collect_axes_and_buttons` translates the axis order and
+            // `native_ev_codes` carries the raw indices, so a lookup can still
+            // resolve -- and the comment there explains the difference.
             ReadingKind::Raw => {
                 let vendor_id = raw_game_controller.HardwareVendorId().unwrap_or(0).to_be();
                 let product_id = raw_game_controller.HardwareProductId().unwrap_or(0).to_be();
@@ -1083,9 +1085,9 @@ impl Gamepad {
         );
         self.axes = Some(
             (0..axis_count)
-                .map(|index| EvCode {
+                .map(|slot| EvCode {
                     kind: EvCodeKind::Axis,
-                    index,
+                    index: sdl_axis_to_raw_index(slot, axis_count),
                 })
                 .chain(
                     // Treat switches as two axes
@@ -1105,6 +1107,40 @@ impl Gamepad {
                 .collect(),
         );
         Ok(())
+    }
+}
+
+/// The `RawGameController` axis index behind SDL's `a<slot>`, for a device that
+/// reports `axis_count` axes.
+///
+/// An SDL mapping's `a0` … `a5` name the axes of the layout the mapping was
+/// written against, which for the Windows mappings our lookup key resolves to is
+/// the DirectInput one: left stick X, left stick Y, **left trigger**, right stick
+/// X, right stick Y, right trigger. Windows Gaming Input reports the same six
+/// axes as left stick X, left stick Y, right stick X, right stick Y, **left
+/// trigger**, right trigger. The two agree on the four stick axes and disagree
+/// about where the triggers sit, so the list `Gamepad::axes` returns is
+/// presented to the mapping layer in SDL's order while every event still carries
+/// the index the device reported.
+///
+/// Without the translation a mapping's `lefttrigger:a2` resolved to the right
+/// stick's X axis, so pulling the left trigger moved the right stick sideways,
+/// moving the right stick's Y axis fired the left trigger, and the left trigger
+/// read as the right one.
+///
+/// Only the six-axis shape has a known translation. A device with a different
+/// axis count keeps its own order, because nothing describes how its axes are
+/// meant to be numbered and a wrong guess would be indistinguishable from having
+/// no mapping at all.
+fn sdl_axis_to_raw_index(slot: u32, axis_count: u32) -> u32 {
+    /// Windows Gaming Input raw index for each SDL axis slot, for a device with
+    /// the documented six-axis gamepad layout.
+    const WGI_RAW_FOR_SDL_SLOT: [u32; 6] = [0, 1, 4, 2, 3, 5];
+
+    if axis_count == WGI_RAW_FOR_SDL_SLOT.len() as u32 {
+        WGI_RAW_FOR_SDL_SLOT[slot as usize]
+    } else {
+        slot
     }
 }
 
@@ -1149,6 +1185,32 @@ impl Display for EvCode {
 pub mod native_ev_codes {
     use super::{EvCode, EvCodeKind};
 
+    // The indices below are Windows Gaming Input's own element order, not the
+    // evdev order the upstream gilrs table was written in. A
+    // `RawGameController` reports a standard gamepad's elements by index, and
+    // `Mapping::default` binds a position name to an element code by matching
+    // these constants against the codes the device actually produces. With the
+    // evdev indices that match is wrong: the face buttons read shifted by one,
+    // the D-pad falls off the end of a device that reports it as buttons, and
+    // the two analog triggers land on the right stick's Y axis and the left
+    // trigger.
+    //
+    // The axis order is Microsoft's: "Xbox controllers have 6 axes: 2 for each
+    // stick and one for each trigger", read as left stick X, left stick Y, right
+    // stick X, right stick Y, left trigger, right trigger
+    // (https://learn.microsoft.com/en-us/uwp/gaming/raw-game-controller). A hat
+    // is reported as a switch rather than an axis, which is why the D-pad axes
+    // are switch indices.
+    //
+    // The button order is the order Windows gamepads expose, which is the order
+    // the SDL mappings for Windows describe. Microsoft does not fix it across
+    // devices -- a device declares its own order in the registry under
+    // `GameInput\Devices\<vid><pid>\Labels\Buttons` -- so a device that reports
+    // a different order needs an SDL mapping that describes it, which is what
+    // `Mapping::default` cannot be. Everything past the guide button is placed
+    // after it so that a device which does not have those elements fails
+    // `Mapping::default`'s presence check instead of borrowing another
+    // button's index.
     pub const AXIS_LSTICKX: EvCode = EvCode {
         kind: EvCodeKind::Axis,
         index: 0,
@@ -1161,15 +1223,15 @@ pub mod native_ev_codes {
         kind: EvCodeKind::Axis,
         index: 2,
     };
-    pub const AXIS_LT2: EvCode = EvCode {
+    pub const AXIS_RSTICKY: EvCode = EvCode {
         kind: EvCodeKind::Axis,
         index: 3,
     };
-    pub const AXIS_RT2: EvCode = EvCode {
+    pub const AXIS_LT2: EvCode = EvCode {
         kind: EvCodeKind::Axis,
         index: 4,
     };
-    pub const AXIS_RSTICKY: EvCode = EvCode {
+    pub const AXIS_RT2: EvCode = EvCode {
         kind: EvCodeKind::Axis,
         index: 5,
     };
@@ -1199,15 +1261,15 @@ pub mod native_ev_codes {
         index: 1,
     };
 
-    pub const BTN_WEST: EvCode = EvCode {
+    pub const BTN_SOUTH: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 0,
     };
-    pub const BTN_SOUTH: EvCode = EvCode {
+    pub const BTN_EAST: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 1,
     };
-    pub const BTN_EAST: EvCode = EvCode {
+    pub const BTN_WEST: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 2,
     };
@@ -1223,69 +1285,70 @@ pub mod native_ev_codes {
         kind: EvCodeKind::Button,
         index: 5,
     };
-    pub const BTN_LT2: EvCode = EvCode {
+    pub const BTN_SELECT: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 6,
     };
-    pub const BTN_RT2: EvCode = EvCode {
+    pub const BTN_START: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 7,
     };
-    pub const BTN_SELECT: EvCode = EvCode {
+    pub const BTN_LTHUMB: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 8,
     };
-    pub const BTN_START: EvCode = EvCode {
+    pub const BTN_RTHUMB: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 9,
     };
-    pub const BTN_LTHUMB: EvCode = EvCode {
+    // A device that reports its D-pad as buttons occupies these four. Keeping
+    // them at their real indices is what makes such a device's D-pad reachable,
+    // and `axis_dpad_to_button` then declines to synthesise a second set from
+    // the hat, which is exactly what that filter's presence check is for.
+    pub const BTN_DPAD_UP: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 10,
     };
-    pub const BTN_RTHUMB: EvCode = EvCode {
+    pub const BTN_DPAD_DOWN: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 11,
     };
-    pub const BTN_MODE: EvCode = EvCode {
+    pub const BTN_DPAD_LEFT: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 12,
     };
-    pub const BTN_C: EvCode = EvCode {
+    pub const BTN_DPAD_RIGHT: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 13,
     };
-    pub const BTN_Z: EvCode = EvCode {
+    pub const BTN_MODE: EvCode = EvCode {
         kind: EvCodeKind::Button,
         index: 14,
     };
-
-    // The DPad for DS4 controllers is a hat/switch that gets mapped to the DPad native event
-    // code buttons. These "buttons" don't exist on the DS4 controller, so it doesn't matter
-    // what the index is, but if it overlaps with an existing button it will send the event
-    // for the overlapping button as a dpad button instead of unknown.
-    // By using a large index it should avoid this.
-    pub const BTN_DPAD_UP: EvCode = EvCode {
+    // A device that reports its triggers as buttons has no fixed index for them,
+    // so these sit past every element a gamepad is known to report and only bind
+    // on a device with more buttons than that.
+    pub const BTN_LT2: EvCode = EvCode {
         kind: EvCodeKind::Button,
-        index: u32::MAX - 3,
+        index: 15,
     };
-    pub const BTN_DPAD_RIGHT: EvCode = EvCode {
+    pub const BTN_RT2: EvCode = EvCode {
         kind: EvCodeKind::Button,
-        index: u32::MAX - 2,
+        index: 16,
     };
-    pub const BTN_DPAD_DOWN: EvCode = EvCode {
+    pub const BTN_C: EvCode = EvCode {
         kind: EvCodeKind::Button,
-        index: u32::MAX - 1,
+        index: 17,
     };
-    pub const BTN_DPAD_LEFT: EvCode = EvCode {
+    pub const BTN_Z: EvCode = EvCode {
         kind: EvCodeKind::Button,
-        index: u32::MAX,
+        index: 18,
     };
 
     pub(super) static BUTTONS: [EvCode; 14] = [
-        BTN_WEST,
         BTN_SOUTH,
         BTN_EAST,
+        BTN_WEST,
         BTN_NORTH,
         BTN_LT,
         BTN_RT,
@@ -1294,30 +1357,47 @@ pub mod native_ev_codes {
         BTN_LTHUMB,
         BTN_RTHUMB,
         BTN_DPAD_UP,
-        BTN_DPAD_RIGHT,
         BTN_DPAD_DOWN,
         BTN_DPAD_LEFT,
+        BTN_DPAD_RIGHT,
     ];
 
     pub(super) static AXES: [EvCode; 6] = [
         AXIS_LSTICKX,
         AXIS_LSTICKY,
         AXIS_RSTICKX,
+        AXIS_RSTICKY,
         AXIS_LT2,
         AXIS_RT2,
-        AXIS_RSTICKY,
     ];
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{raw_axis_value, reading_kind_for, AxisInfo, ReadingKind};
+    use super::{
+        native_ev_codes, raw_axis_value, reading_kind_for, sdl_axis_to_raw_index, AxisInfo, EvCode,
+        EvCodeKind, ReadingKind,
+    };
 
     const AXIS_RANGE: AxisInfo = AxisInfo {
         min: i32::MIN,
         max: i32::MAX,
         deadzone: None,
     };
+
+    fn axis(index: u32) -> EvCode {
+        EvCode {
+            kind: EvCodeKind::Axis,
+            index,
+        }
+    }
+
+    fn button(index: u32) -> EvCode {
+        EvCode {
+            kind: EvCodeKind::Button,
+            index,
+        }
+    }
 
     /// Mirrors `gilrs::gamepad::axis_value`, which renormalizes whatever range
     /// `Gamepad::axis_info` reports onto `[-1.0, 1.0]`.
@@ -1378,5 +1458,121 @@ mod tests {
     #[test]
     fn a_device_without_a_raw_report_falls_back_to_the_mapped_reading() {
         assert_eq!(ReadingKind::Gamepad, reading_kind_for(0, 0, 0));
+    }
+
+    /// Microsoft's `Raw game controller` documentation fixes the six axes of a
+    /// gamepad: left stick X, left stick Y, right stick X, right stick Y, left
+    /// trigger, right trigger. `Mapping::default` binds a position name to an
+    /// element code by matching these constants against what the device
+    /// reports, so a constant carrying the evdev index instead made the left
+    /// trigger read the right stick's Y axis, the right trigger read the left
+    /// trigger, and the right stick's Y axis read the right trigger. A resting
+    /// stick then sat exactly on the axis-to-button threshold, so the trigger it
+    /// fed flapped on every sample.
+    #[test]
+    fn the_position_names_carry_the_windows_gaming_input_axis_order() {
+        use native_ev_codes::{
+            AXIS_LSTICKX, AXIS_LSTICKY, AXIS_LT2, AXIS_RSTICKX, AXIS_RSTICKY, AXIS_RT2,
+        };
+
+        assert_eq!(AXIS_LSTICKX, axis(0));
+        assert_eq!(AXIS_LSTICKY, axis(1));
+        assert_eq!(AXIS_RSTICKX, axis(2));
+        assert_eq!(AXIS_RSTICKY, axis(3));
+        assert_eq!(AXIS_LT2, axis(4));
+        assert_eq!(AXIS_RT2, axis(5));
+    }
+
+    /// The four face buttons are the other half of the same table, and the shift
+    /// is what a user sees as "the wrong key lights up": the evdev order put
+    /// west at index zero, so a device reporting the Windows order showed its
+    /// south button's press as west, east as south and west as east.
+    #[test]
+    fn the_face_buttons_carry_the_windows_gaming_input_button_order() {
+        use native_ev_codes::{BTN_EAST, BTN_NORTH, BTN_SOUTH, BTN_WEST};
+
+        assert_eq!(BTN_SOUTH, button(0));
+        assert_eq!(BTN_EAST, button(1));
+        assert_eq!(BTN_WEST, button(2));
+        assert_eq!(BTN_NORTH, button(3));
+    }
+
+    /// The D-pad has to be reachable on a device that reports it as four
+    /// buttons. With the codes parked past the end of every device the buttons
+    /// fell off the end of the table and every direction was dead, which is the
+    /// "the cross does nothing" half of the same report.
+    #[test]
+    fn a_device_that_reports_its_dpad_as_buttons_reaches_every_direction() {
+        use native_ev_codes::{BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, BTN_DPAD_UP};
+
+        // The order the directions occupy is the one a Windows gamepad reports
+        // them in, after the two stick clicks.
+        assert_eq!(BTN_DPAD_UP, button(10));
+        assert_eq!(BTN_DPAD_DOWN, button(11));
+        assert_eq!(BTN_DPAD_LEFT, button(12));
+        assert_eq!(BTN_DPAD_RIGHT, button(13));
+
+        // `Mapping::default` keeps a code only when the device reports that many
+        // buttons, so all four have to be inside a fifteen-button device and
+        // outside a ten-button one.
+        let reports = |button_count: u32| (0..button_count).map(button).collect::<Vec<EvCode>>();
+        let fifteen = reports(15);
+        let ten = reports(10);
+        for direction in [BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT] {
+            assert!(
+                fifteen.contains(&direction),
+                "{direction:?} must be reachable on a fifteen-button device"
+            );
+            assert!(
+                !ten.contains(&direction),
+                "{direction:?} must not bind on a ten-button device"
+            );
+        }
+    }
+
+    /// An SDL mapping's `a<slot>` names the axis of the layout it was written
+    /// against, which for the Windows mappings is the DirectInput one. The raw
+    /// reading has to be presented in that order or every mapping resolves the
+    /// wrong axis, while the events themselves keep carrying the index the
+    /// device reported.
+    #[test]
+    fn a_mapping_slot_resolves_to_the_raw_axis_behind_that_control() {
+        // SDL slot 0 and 1 are the left stick's X and Y in both layouts.
+        assert_eq!(sdl_axis_to_raw_index(0, 6), 0);
+        assert_eq!(sdl_axis_to_raw_index(1, 6), 1);
+        // SDL slot 2 is the left trigger, which Windows reports as raw axis 4.
+        assert_eq!(sdl_axis_to_raw_index(2, 6), 4);
+        // SDL slots 3 and 4 are the right stick's X and Y, raw axes 2 and 3.
+        assert_eq!(sdl_axis_to_raw_index(3, 6), 2);
+        assert_eq!(sdl_axis_to_raw_index(4, 6), 3);
+        // SDL slot 5 is the right trigger, raw axis 5 in both layouts.
+        assert_eq!(sdl_axis_to_raw_index(5, 6), 5);
+
+        // The translation must be a bijection, or an axis would be unreachable
+        // and another would answer twice.
+        let mut seen = std::collections::BTreeSet::new();
+        for slot in 0..6 {
+            assert!(
+                seen.insert(sdl_axis_to_raw_index(slot, 6)),
+                "SDL slot {slot} resolves to an axis another slot already claims"
+            );
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    /// Only the six-axis shape has a known translation. Any other axis count
+    /// keeps the device's own order, because a guess would be indistinguishable
+    /// from having no mapping at all.
+    #[test]
+    fn a_device_without_the_six_axis_shape_keeps_its_own_axis_order() {
+        for axis_count in [0, 1, 2, 3, 4, 5, 7, 8] {
+            for slot in 0..axis_count {
+                assert_eq!(
+                    sdl_axis_to_raw_index(slot, axis_count),
+                    slot,
+                    "{axis_count} axes: slot {slot} must keep its own index"
+                );
+            }
+        }
     }
 }
