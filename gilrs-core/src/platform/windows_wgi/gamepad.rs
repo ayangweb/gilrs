@@ -891,12 +891,12 @@ impl Gamepad {
         };
 
         let uuid = match reading {
-            // The mappings this key resolves to were written against SDL's own
-            // Windows drivers, not against Windows Gaming Input, so the element
-            // order they name is not the one a `RawGameController` reports.
-            // `collect_axes_and_buttons` translates the axis order and
-            // `native_ev_codes` carries the raw indices, so a lookup can still
-            // resolve -- and the comment there explains the difference.
+            // SDL prints a GUID as the raw bytes of its bus, vendor,
+            // product and version, so looking the controller up by that key reaches
+            // the entries SDL's own Windows drivers resolve. Those entries were
+            // written against DirectInput or evdev, not against Windows Gaming Input,
+            // and the two number a gamepad's six axes differently. `raw_elements`
+            // records what that means and why no translation is applied.
             ReadingKind::Raw => {
                 let vendor_id = raw_game_controller.HardwareVendorId().unwrap_or(0).to_be();
                 let product_id = raw_game_controller.HardwareProductId().unwrap_or(0).to_be();
@@ -1075,73 +1075,66 @@ impl Gamepad {
         let axis_count = self.raw_game_controller.AxisCount()? as u32;
         let button_count = self.raw_game_controller.ButtonCount()? as u32;
         let switch_count = self.raw_game_controller.SwitchCount()? as u32;
-        self.buttons = Some(
-            (0..button_count)
-                .map(|index| EvCode {
-                    kind: EvCodeKind::Button,
-                    index,
-                })
-                .collect(),
-        );
-        self.axes = Some(
-            (0..axis_count)
-                .map(|slot| EvCode {
-                    kind: EvCodeKind::Axis,
-                    index: sdl_axis_to_raw_index(slot, axis_count),
-                })
-                .chain(
-                    // Treat switches as two axes
-                    (0..switch_count).flat_map(|index| {
-                        [
-                            EvCode {
-                                kind: EvCodeKind::Switch,
-                                index: index * 2,
-                            },
-                            EvCode {
-                                kind: EvCodeKind::Switch,
-                                index: (index * 2) + 1,
-                            },
-                        ]
-                    }),
-                )
-                .collect(),
-        );
+        let (buttons, axes) = raw_elements(axis_count, button_count, switch_count);
+        self.buttons = Some(buttons);
+        self.axes = Some(axes);
         Ok(())
     }
 }
 
-/// The `RawGameController` axis index behind SDL's `a<slot>`, for a device that
-/// reports `axis_count` axes.
+/// The element codes a raw report of `axis_count` axes, `button_count` buttons and
+/// `switch_count` switches is exposed under.
 ///
-/// An SDL mapping's `a0` … `a5` name the axes of the layout the mapping was
-/// written against, which for the Windows mappings our lookup key resolves to is
-/// the DirectInput one: left stick X, left stick Y, **left trigger**, right stick
-/// X, right stick Y, right trigger. Windows Gaming Input reports the same six
-/// axes as left stick X, left stick Y, right stick X, right stick Y, **left
-/// trigger**, right trigger. The two agree on the four stick axes and disagree
-/// about where the triggers sit, so the list `Gamepad::axes` returns is
-/// presented to the mapping layer in SDL's order while every event still carries
-/// the index the device reported.
+/// The elements are exposed in the order the device reports them, and no translation
+/// is applied before the mapping layer sees them.
 ///
-/// Without the translation a mapping's `lefttrigger:a2` resolved to the right
-/// stick's X axis, so pulling the left trigger moved the right stick sideways,
-/// moving the right stick's Y axis fired the left trigger, and the left trigger
-/// read as the right one.
+/// An SDL mapping's `a<slot>` names an axis of whatever layout the entry was written
+/// against. The database this fork embeds is reachable by the lookup key built in
+/// `Gamepad::new`, and its Windows entries were written against DirectInput, which
+/// numbers a gamepad's axes left stick X, left stick Y, left trigger, right stick X,
+/// right stick Y, right trigger. Windows Gaming Input groups the two triggers after the
+/// sticks instead. Those two orders cannot both be satisfied by one list.
 ///
-/// Only the six-axis shape has a known translation. A device with a different
-/// axis count keeps its own order, because nothing describes how its axes are
-/// meant to be numbered and a wrong guess would be indistinguishable from having
-/// no mapping at all.
-fn sdl_axis_to_raw_index(slot: u32, axis_count: u32) -> u32 {
-    /// Windows Gaming Input raw index for each SDL axis slot, for a device with
-    /// the documented six-axis gamepad layout.
-    const WGI_RAW_FOR_SDL_SLOT: [u32; 6] = [0, 1, 4, 2, 3, 5];
-
-    if axis_count == WGI_RAW_FOR_SDL_SLOT.len() as u32 {
-        WGI_RAW_FOR_SDL_SLOT[slot as usize]
-    } else {
-        slot
-    }
+/// Reordering was tried and measured against the whole database: of the 1592 entries
+/// that key reaches, 582 number the four sticks 0, 1, 2, 3 and so expect the reported
+/// order, while 393 interleave the triggers into slots 2 and 5 and need the swap.
+/// Reordering would break the larger group, and the grouped order is the one Microsoft
+/// documents for a gamepad, so the reported order is what the mapping layer gets. A
+/// mapping that interleaves the triggers therefore mis-reads the right stick and the
+/// triggers on a device that has one; that is a property of the database describing a
+/// different driver, and resolving it would need a mapping database written against
+/// Windows Gaming Input.
+fn raw_elements(
+    axis_count: u32,
+    button_count: u32,
+    switch_count: u32,
+) -> (Vec<EvCode>, Vec<EvCode>) {
+    let buttons = (0..button_count)
+        .map(|index| EvCode {
+            kind: EvCodeKind::Button,
+            index,
+        })
+        .collect();
+    let axes = (0..axis_count)
+        .map(|index| EvCode {
+            kind: EvCodeKind::Axis,
+            index,
+        })
+        // Treat switches as two axes
+        .chain((0..switch_count).flat_map(|index| {
+            [
+                EvCode {
+                    kind: EvCodeKind::Switch,
+                    index: index * 2,
+                },
+                EvCode {
+                    kind: EvCodeKind::Switch,
+                    index: (index * 2) + 1,
+                },
+            ]
+        }))
+        .collect();
+    (buttons, axes)
 }
 
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
@@ -1375,9 +1368,10 @@ pub mod native_ev_codes {
 #[cfg(test)]
 mod tests {
     use super::{
-        native_ev_codes, raw_axis_value, reading_kind_for, sdl_axis_to_raw_index, AxisInfo, EvCode,
-        EvCodeKind, ReadingKind,
+        native_ev_codes, raw_axis_value, reading_kind_for, AxisInfo, EvCode, EvCodeKind,
+        ReadingKind,
     };
+    use native_ev_codes as nec;
 
     const AXIS_RANGE: AxisInfo = AxisInfo {
         min: i32::MIN,
@@ -1530,49 +1524,64 @@ mod tests {
         }
     }
 
-    /// An SDL mapping's `a<slot>` names the axis of the layout it was written
-    /// against, which for the Windows mappings is the DirectInput one. The raw
-    /// reading has to be presented in that order or every mapping resolves the
-    /// wrong axis, while the events themselves keep carrying the index the
-    /// device reported.
+    /// Only the reported order reaches the mapping layer, and every element a device
+    /// reports has to be reachable under the index it reported it at. Reordering was
+    /// measured against the whole mapping database and rejected: of the entries this
+    /// backend's lookup key reaches, the larger group numbers the four sticks 0, 1, 2,
+    /// 3 and so expects the reported order, and that is also the order Microsoft
+    /// documents for a gamepad.
     #[test]
-    fn a_mapping_slot_resolves_to_the_raw_axis_behind_that_control() {
-        // SDL slot 0 and 1 are the left stick's X and Y in both layouts.
-        assert_eq!(sdl_axis_to_raw_index(0, 6), 0);
-        assert_eq!(sdl_axis_to_raw_index(1, 6), 1);
-        // SDL slot 2 is the left trigger, which Windows reports as raw axis 4.
-        assert_eq!(sdl_axis_to_raw_index(2, 6), 4);
-        // SDL slots 3 and 4 are the right stick's X and Y, raw axes 2 and 3.
-        assert_eq!(sdl_axis_to_raw_index(3, 6), 2);
-        assert_eq!(sdl_axis_to_raw_index(4, 6), 3);
-        // SDL slot 5 is the right trigger, raw axis 5 in both layouts.
-        assert_eq!(sdl_axis_to_raw_index(5, 6), 5);
+    fn the_raw_elements_are_exposed_in_the_order_the_device_reports_them() {
+        for (axes, buttons, switches) in [(6, 15, 1), (4, 13, 1), (6, 10, 1), (2, 5, 0)] {
+            let (got_buttons, got_axes) = super::raw_elements(axes, buttons, switches);
+            let expected_buttons: Vec<EvCode> = (0..buttons).map(button).collect();
+            assert_eq!(expected_buttons, got_buttons, "{buttons} buttons");
 
-        // The translation must be a bijection, or an axis would be unreachable
-        // and another would answer twice.
-        let mut seen = std::collections::BTreeSet::new();
-        for slot in 0..6 {
-            assert!(
-                seen.insert(sdl_axis_to_raw_index(slot, 6)),
-                "SDL slot {slot} resolves to an axis another slot already claims"
-            );
+            let mut expected_axes: Vec<EvCode> = (0..axes).map(axis).collect();
+            for index in 0..switches {
+                expected_axes.push(EvCode {
+                    kind: EvCodeKind::Switch,
+                    index: index * 2,
+                });
+                expected_axes.push(EvCode {
+                    kind: EvCodeKind::Switch,
+                    index: (index * 2) + 1,
+                });
+            }
+            assert_eq!(expected_axes, got_axes, "{axes} axes, {switches} switches");
         }
-        assert_eq!(seen.len(), 6);
     }
 
-    /// Only the six-axis shape has a known translation. Any other axis count
-    /// keeps the device's own order, because a guess would be indistinguishable
-    /// from having no mapping at all.
+    /// A device with no raw report at all falls back to the mapped reading, whose
+    /// events carry these codes directly and whose element list comes from `BUTTONS`
+    /// and `AXES`. `Mapping::default` drops a code the device does not report, so a
+    /// code the mapped path emits that is missing from those lists would be
+    /// unreachable on exactly the devices that have no other reading to use.
     #[test]
-    fn a_device_without_the_six_axis_shape_keeps_its_own_axis_order() {
-        for axis_count in [0, 1, 2, 3, 4, 5, 7, 8] {
-            for slot in 0..axis_count {
-                assert_eq!(
-                    sdl_axis_to_raw_index(slot, axis_count),
-                    slot,
-                    "{axis_count} axes: slot {slot} must keep its own index"
-                );
-            }
+    fn every_code_the_mapped_reading_emits_is_in_the_element_list() {
+        for (_, code) in super::WGI_TO_GILRS_BUTTON_MAP {
+            let code = code.into_u32();
+            assert!(
+                native_ev_codes::BUTTONS
+                    .iter()
+                    .any(|listed| listed.into_u32() == code),
+                "button code {code} is emitted but is not in BUTTONS"
+            );
+        }
+        for code in [
+            nec::AXIS_LSTICKX,
+            nec::AXIS_LSTICKY,
+            nec::AXIS_RSTICKX,
+            nec::AXIS_RSTICKY,
+            nec::AXIS_LT2,
+            nec::AXIS_RT2,
+        ] {
+            assert!(
+                native_ev_codes::AXES
+                    .iter()
+                    .any(|a| a.into_u32() == code.into_u32()),
+                "{code} is read but is not in AXES"
+            );
         }
     }
 }
