@@ -38,7 +38,10 @@ use winapi::um::xinput::{
 const EVENT_THREAD_SLEEP_TIME: u64 = 10;
 const ITERATIONS_TO_CHECK_IF_CONNECTED: u64 = 100;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-
+// A connected pad can briefly report DeviceNotConnected while its USB/XUSB
+// device re-enumerates. Require ~1s of consecutive misses (the worker sleeps
+// 10ms) before disconnecting to avoid spurious Connected/Disconnected churn.
+const DISCONNECT_CONFIRMATIONS: u8 = 100;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerExit {
     Stopped,
@@ -254,12 +257,13 @@ impl Gilrs {
         let mut connected = connected;
         let mut counter = 0;
         let mut force_snapshot = false;
-
+        let mut disconnect_misses: [u8; MAX_XINPUT_CONTROLLERS] = [0; MAX_XINPUT_CONTROLLERS];
         loop {
             match control_rx.try_recv() {
                 Ok(Control::Stop) | Err(TryRecvError::Disconnected) => break,
                 Ok(Control::Reset(ack)) => {
                     prev_states = [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
+                    disconnect_misses = [0; MAX_XINPUT_CONTROLLERS];
                     force_snapshot = true;
                     let _ = ack.send(Ok(()));
                 }
@@ -273,6 +277,7 @@ impl Gilrs {
                 {
                     match xinput_handle.get_state(id as u32) {
                         Ok(XInputState { raw: state }) => {
+                            disconnect_misses[id] = 0;
                             if !connected[id] {
                                 connected[id] = true;
                                 Self::send_xinput_event(
@@ -297,12 +302,16 @@ impl Gilrs {
                             }
                         }
                         Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
-                            connected[id] = false;
-                            Self::send_xinput_event(
-                                &tx,
-                                epoch,
-                                Event::new(id, EventType::Disconnected),
-                            );
+                            disconnect_misses[id] = disconnect_misses[id].saturating_add(1);
+                            if disconnect_misses[id] >= DISCONNECT_CONFIRMATIONS {
+                                connected[id] = false;
+                                disconnect_misses[id] = 0;
+                                Self::send_xinput_event(
+                                    &tx,
+                                    epoch,
+                                    Event::new(id, EventType::Disconnected),
+                                );
+                            }
                         }
                         Err(XInputUsageError::DeviceNotConnected) => (),
                         Err(e) => error!("Failed to get gamepad state: {:?}", e),
